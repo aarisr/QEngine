@@ -588,6 +588,7 @@ private:
         std::string path;                   // non-empty: on disk (or being written)
         std::shared_ptr<DiskState> disk;
         size_t data_off = 0;                // file offset of GPU 0's buffer
+        size_t disk_size = 0;               // complete file size, including metadata
         unsigned long long used = 0, born = 0;  // born: tick when made (0: found on disk at start)
         int prio = 1;                       // of the conversation when archived (Seq::prio): logs only, no order reads it
         double last_s = 0;                  // the conversation's last use (Seq::last_s; restored from it: then), mono_s()

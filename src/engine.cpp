@@ -2,6 +2,7 @@
 #include <cuda_profiler_api.h>
 #include "env.h"
 #include "engine.h"
+#include "archive_format.h"
 #include "drv_gate.h"
 #include "kernels/watchdog.cuh"
 #include "kernels/gemv.cuh"
@@ -1889,13 +1890,12 @@ uint64_t fnv64(const int* p, int n) {
     }
     return h;
 }
-// 0003: the header holds a payload checksum per GPU section part (open_findings DK-L6); 0002 files (no checksums) still load
-constexpr char kArchMagic[8] = {'Q', 'K', 'V', 'A', '0', '0', '0', '3'};
-constexpr char kArchMagicV2[8] = {'Q', 'K', 'V', 'A', '0', '0', '0', '2'};
-// 64-bit payload checksum (4 independent multiply-rotate lanes over 8-byte words, then the tail): catches a file of the right
-// size with wrong contents (a write cut by power loss), not an adversary
-// streaming form of arch_hash for read-and-hash in pieces (review L4): update() takes multiples of 32 bytes, the last piece
-// of a region goes to final(); the result equals arch_hash over the whole region
+// 64-bit payload checksum (4 independent multiply-rotate lanes over 8-byte
+// words, then the tail): catches a file of the right size with wrong contents
+// (a write cut by power loss), not an adversary streaming form of arch_hash for
+// read-and-hash in pieces (review L4): update() takes multiples of 32 bytes,
+// the last piece of a region goes to final(); the result equals arch_hash over
+// the whole region
 struct ArchHash {
     uint64_t h[4] = {0x9E3779B185EBCA87ull + 0xC2B2AE3D27D4EB4Full, 0xC2B2AE3D27D4EB4Full, 0, 0 - 0x9E3779B185EBCA87ull};
     size_t n = 0;
@@ -1942,19 +1942,6 @@ uint64_t arch_hash(const void* data, size_t n) {
     t ^= t >> 29;
     t *= P2;
     return t ^ (t >> 32);
-}
-template <typename T>
-void put(std::vector<char>& b, const T& v) {
-    const char* p = (const char*)&v;
-    b.insert(b.end(), p, p + sizeof(T));
-}
-// (review L5) checksum of what indexes an archive: its length, checkpoint positions and token ids
-uint64_t arch_hdr_hash(int32_t n, const std::vector<int>& subs, const int* toks) {
-    std::vector<char> b;
-    put(b, n);
-    for (int p : subs) put(b, (int32_t)p);
-    b.insert(b.end(), (const char*)toks, (const char*)toks + (size_t)n * 4);
-    return arch_hash(b.data(), b.size());
 }
 bool read_all(int fd, void* dst, size_t n, size_t off) {
     char* d = (char*)dst;
@@ -2246,9 +2233,17 @@ int Engine::num_disk_archives() const {
 
 // Remove an archive entirely (memory and file).
 void Engine::drop_archive(std::list<KvArchive>::iterator it) {
-    if (it->pinned) prefix_used_ -= it->total;
-    else if (it->ram) archive_used_ -= it->total;
-    disk_forget(*it);
+  switch (qkva::ram_tier(it->pinned, (bool)it->ram)) {
+  case qkva::RamTier::prefix:
+    prefix_used_ -= it->total;
+    break;
+  case qkva::RamTier::ordinary:
+    archive_used_ -= it->total;
+    break;
+  case qkva::RamTier::none:
+    break;
+  }
+  disk_forget(*it);
     archives_.erase(it);
 }
 
@@ -2274,7 +2269,7 @@ void Engine::disk_forget(KvArchive& a) {
         if (a.disk->done) unlink(a.path.c_str());
         else a.disk->cancel = true;
     }
-    disk_used_ -= a.total;
+    disk_used_ -= a.disk_size;
     a.path.clear();
     a.disk.reset();
 }
@@ -2512,9 +2507,9 @@ void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long lo
             if (!it->path.empty()) {  // a finished file stays until the new archive's file is written (disk_flush_covered)
                 std::lock_guard<std::mutex> l(it->disk->mu);
                 if (it->disk->done && it->disk->ok) {
-                    covered_files_.push_back({it->path, it->total});
-                    disk_used_ -= it->total;
-                    disk_covered_ += it->total;  // (rereview M1 / L2: still on the drive until deleted)
+                    covered_files_.push_back({it->path, it->disk_size});
+                    disk_used_ -= it->disk_size;
+                    disk_covered_ += it->disk_size;  // (rereview M1 / L2: still on the drive until deleted)
                     it->path.clear();
                 }
             }
@@ -2739,9 +2734,29 @@ void Engine::archive_slot(int slot, bool force) {
     });
     archive_used_ += a.total;
     archives_.push_back(std::move(a));
-    // (steered conversations stay in host memory: the disk cache has no steering key)
-    if (!disk_dir_.empty() && !archives_.back().split && archives_.back().sk < 0) disk_enqueue(archives_.back());
-    disk_flush_covered();
+  KvArchive &stored = archives_.back();
+  if (!disk_dir_.empty() && stored.sk < 0) {
+    KvArchive *dep = nullptr;
+    if (stored.split)
+      for (auto &x : archives_)
+        if (x.pinned && x.sk == stored.sk && x.n == stored.split &&
+            std::equal(x.toks.begin(), x.toks.end(), stored.toks.begin())) {
+          dep = &x;
+          break;
+        }
+    if (!stored.split || dep) {
+      if (dep && dep->path.empty())
+        disk_enqueue(*dep);
+      if (!dep || !dep->path.empty()) {
+        if (dep)
+          ++dep->hold;
+        disk_enqueue(stored);
+        if (dep)
+          --dep->hold;
+      }
+    }
+  }
+  disk_flush_covered();
 }
 
 // Prepare the archive of an idle slot for incremental copying (pieces copied by archive_more).
@@ -2816,8 +2831,29 @@ void Engine::bg_finish(bool all) {
             printf("archive: slot %d %d tokens prio %d in the background, %zu checkpoints, %.2f GB (used %.2f of %.2f GB)\n",
                    bg_.slot, a.n, a.prio, a.subs.size(), a.total / 1e9, archive_used_ / 1e9, archive_budget_ / 1e9), fflush(stdout);
         archives_.push_back(std::move(a));
-        if (!disk_dir_.empty() && !archives_.back().split && archives_.back().sk < 0) disk_enqueue(archives_.back());
-        disk_flush_covered();
+    KvArchive &stored = archives_.back();
+    if (!disk_dir_.empty() && stored.sk < 0) {
+      KvArchive *dep = nullptr;
+      if (stored.split)
+        for (auto &x : archives_)
+          if (x.pinned && x.sk == stored.sk && x.n == stored.split &&
+              std::equal(x.toks.begin(), x.toks.end(), stored.toks.begin())) {
+            dep = &x;
+            break;
+          }
+      if (!stored.split || dep) {
+        if (dep && dep->path.empty())
+          disk_enqueue(*dep);
+        if (!dep || !dep->path.empty()) {
+          if (dep)
+            ++dep->hold;
+          disk_enqueue(stored);
+          if (dep)
+            --dep->hold;
+        }
+      }
+    }
+    disk_flush_covered();
         bg_ = BgArchive{};
     }
 }
@@ -2875,7 +2911,9 @@ void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
         if (a.pinned && a.sk == q.sk && a.n == pos && std::equal(ids, ids + pos, a.toks.begin())) {
             a.used = ++tick_;
             a.affinity = affinity;
-            return;
+      if (!disk_dir_.empty() && a.sk < 0 && a.path.empty())
+        disk_enqueue(a);
+      return;
         }
     const int ng = workers_.size();
     KvArchive a;
@@ -2887,11 +2925,14 @@ void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
     while (prefix_used_ + a.total > prefix_budget_) {
         auto v = archives_.end();
         for (auto it = archives_.begin(); it != archives_.end(); ++it)
-            if (it->pinned && !it->hold && (v == archives_.end() || it->used < v->used))
+            if (it->pinned && it->ram && !it->hold && (v == archives_.end() || it->used < v->used))
                 v = it;
         if (v == archives_.end()) return;
-        prefix_used_ -= v->total;
-        archives_.erase(v);
+    if (!v->path.empty() && arch_present(*v)) {
+      v->ram.reset();
+      prefix_used_ -= v->total;
+    } else
+      drop_archive(v);
     }
     a.ram = std::make_shared<Bufs>(&hpool_);
     for (size_t sz : a.sizes) a.ram->add(sz);
@@ -2911,6 +2952,8 @@ void Engine::pin_prefix(int slot, int pos, unsigned long long affinity) {
         printf("archive: pinned prefix %d tokens of slot %d (%.2f GB, pinned %.2f of %.2f GB)\n", pos, slot, a.total / 1e9,
                prefix_used_ / 1e9, prefix_budget_ / 1e9), fflush(stdout);
     archives_.push_back(std::move(a));
+  if (!disk_dir_.empty() && archives_.back().sk < 0)
+    disk_enqueue(archives_.back());
     // the shared region: a copy of the rows on the GPU (other slots attach to it instead of
     // copying the prefix into their own regions)
     if (share_prefix_ && find_prefix(ids, pos, q.sk) < 0) {
@@ -2985,40 +3028,44 @@ void Engine::disk_flush_covered() {
 }
 
 void Engine::disk_enqueue(KvArchive& a) {
-    if (a.total > disk_budget_) return;
-    disk_make_room(a.total);
-    char name[64];
-    snprintf(name, sizeof name, "/%016llx_%d.qkv", (unsigned long long)fnv64(a.toks.data(), a.n), a.n);
+    if (disk_dir_.empty() || !a.path.empty() || !a.ram)
+    return;
+  DiskJob j;
+  j.ram = a.ram;
+  j.sizes = a.sizes;
+  j.st = std::make_shared<DiskState>();
+  qkva::Header meta;
+  meta.fingerprint = fingerprint_;
+  meta.n = a.n;
+  meta.pinned = a.pinned ? 1 : 0;
+  meta.split = a.split;
+  for (int x : a.subs)
+    meta.subs.push_back(x);
+  for (size_t x : a.sizes)
+    meta.sizes.push_back(x);
+  meta.hashes.resize(a.sizes.size() * (1 + a.subs.size()));
+  meta.toks.assign(a.toks.begin(), a.toks.end());
+  if (!qkva::valid(meta, workers_.size(), kMaxSubs))
+    return;
+  j.header = qkva::encode(meta, &j.hash_off);
+  if (j.header.size() > SIZE_MAX - a.total)
+    return;
+  a.disk_size = j.header.size() + a.total;
+  if (a.disk_size > disk_budget_) return;
+    disk_make_room(a.disk_size);
+  if (disk_used_ + disk_covered_ + a.disk_size > disk_budget_)
+    return;
+    char name[96];
+    snprintf(name, sizeof name, "/%c_%016llx_%d_%d.qkv", a.pinned ? 'p' : 'a', (unsigned long long)fnv64(a.toks.data(), a.n), a.n, a.split);
     a.path = disk_dir_ + name;
-    a.disk = std::make_shared<DiskState>();
-    disk_used_ += a.total;
-    DiskJob j;
-    j.ram = a.ram;
-    j.sizes = a.sizes;
+    a.disk = j.st;
     j.path = a.path;
-    j.st = a.disk;
     j.covered = std::move(covered_files_);
     covered_files_.clear();
-    std::vector<char>& h = j.header;
-    h.insert(h.end(), kArchMagic, kArchMagic + 8);
-    put(h, (uint32_t)fingerprint_.size());
-    h.insert(h.end(), fingerprint_.begin(), fingerprint_.end());
-    put(h, (int32_t)a.n);
-    put(h, (uint32_t)a.subs.size());
-    for (int p : a.subs) put(h, (int32_t)p);
-    put(h, (uint32_t)a.sizes.size());
-    for (size_t sz : a.sizes) put(h, (uint64_t)sz);
-    // checksums (filled by the writer): per GPU section, the KV rows, then each delta-net state (a state is read alone)
-    const uint32_t nh = (uint32_t)(a.sizes.size() * (1 + a.subs.size()));
-    put(h, nh);
-    j.hash_off = h.size();
-    h.resize(h.size() + (size_t)nh * 8, 0);
+  disk_used_ += a.disk_size;
     j.ns = (int)a.subs.size();
     for (auto& w : workers_) j.snb.push_back(w->snapshot_bytes());
-    put(h, arch_hdr_hash(a.n, a.subs, a.toks.data()));  // (review L5) the token ids / positions are checked at the index too
-    const char* t = (const char*)a.toks.data();
-    h.insert(h.end(), t, t + (size_t)a.n * 4);
-    a.data_off = h.size();
+  a.data_off = j.header.size();
     {
         std::lock_guard<std::mutex> l(disk_mu_);
         disk_q_.push_back(std::move(j));
@@ -3127,7 +3174,32 @@ void Engine::disk_wait_idle() {
 bool Engine::archive_load(KvArchive& a) {
     if (a.ram) return true;
     if (a.path.empty()) return false;
-    {
+  struct Hold {
+    KvArchive &a;
+    explicit Hold(KvArchive &x) : a(x) { ++a.hold; }
+    ~Hold() { --a.hold; }
+  } held(a);
+  if (a.pinned) {
+    if (a.total > prefix_budget_)
+      return false;
+    while (prefix_used_ + a.total > prefix_budget_) {
+      auto v = archives_.end();
+      for (auto it = archives_.begin(); it != archives_.end(); ++it)
+        if (it->pinned && it->ram && !it->hold &&
+            (v == archives_.end() || it->used < v->used))
+          v = it;
+      if (v == archives_.end())
+        return false;
+      if (!v->path.empty() && arch_present(*v)) {
+        v->ram.reset();
+        prefix_used_ -= v->total;
+      } else
+        drop_archive(v);
+    }
+  } else if (!ram_make_room(a.total, a.prio)) {
+    return false;
+  }
+  {
         std::unique_lock<std::mutex> l(a.disk->mu);
         a.disk->cv.wait(l, [&] { return a.disk->done; });
         if (!a.disk->ok) return false;
@@ -3167,9 +3239,11 @@ bool Engine::archive_load(KvArchive& a) {
         fprintf(stderr, "disk cache: unreadable or checksum mismatch, dropped: %s\n", a.path.c_str());
         return false;
     }
-    utimensat(AT_FDCWD, a.path.c_str(), nullptr, 0);  // recently used (LRU across restarts)
-    ram_make_room(a.total, a.prio);
-    a.ram = bufs;
+    utimensat(AT_FDCWD, a.path.c_str(), nullptr, 0); // recently used (LRU across restarts)
+  a.ram = bufs;
+  if (qkva::ram_tier(a.pinned, true) == qkva::RamTier::prefix)
+    prefix_used_ += a.total;
+  else
     archive_used_ += a.total;
     return true;
 }
@@ -3220,67 +3294,141 @@ void Engine::disk_init() {
             if (nm.size() < 5 || nm.compare(nm.size() - 4, 4, ".qkv") != 0) continue;
             FILE* f = fopen(path.c_str(), "rb");
             if (!f) continue;
-            KvArchive a;
-            bool ok = false;
-            do {
-                char mg[8];
-                uint32_t fl, ns, ngs;
-                int32_t n;
-                if (fread(mg, 1, 8, f) != 8) break;
-                const bool v3 = memcmp(mg, kArchMagic, 8) == 0;
-                if (!v3 && memcmp(mg, kArchMagicV2, 8) != 0) break;
-                if (fread(&fl, 4, 1, f) != 1 || fl > 65536) break;
-                std::string fps(fl, '\0');
-                if (fread(&fps[0], 1, fl, f) != fl || fps != fingerprint_) break;
-                if (fread(&n, 4, 1, f) != 1 || n <= 0) break;
-                if (fread(&ns, 4, 1, f) != 1 || ns > kMaxSubs) break;
-                a.subs.resize(ns);
-                if (ns && fread(a.subs.data(), 4, ns, f) != ns) break;
-                if (fread(&ngs, 4, 1, f) != 1 || ngs != workers_.size()) break;
-                bool sz_ok = true;
-                for (uint32_t r = 0; r < ngs; r++) {
-                    uint64_t sz;
-                    if (fread(&sz, 8, 1, f) != 1) { sz_ok = false; break; }
-                    sz_ok &= sz == workers_[r]->archive_bytes(0, n) + ns * workers_[r]->snapshot_bytes();
-                    a.sizes.push_back(sz);
-                    a.total += sz;
-                }
-                if (!sz_ok) break;
-                std::vector<uint64_t> hs;
-                uint64_t hh = 0;
-                if (v3) {
-                    uint32_t nh;
-                    if (fread(&nh, 4, 1, f) != 1 || nh != ngs * (1 + ns)) break;
-                    hs.resize(nh);
-                    if (fread(hs.data(), 8, nh, f) != nh) break;
-                    if (fread(&hh, 8, 1, f) != 1) break;
-                }
-                a.toks.resize(n);
-                if (fread(a.toks.data(), 4, n, f) != (size_t)n) break;
-                if (v3 && arch_hdr_hash(n, a.subs, a.toks.data()) != hh) {  // (review L5) a flipped token id: not this prompt
-                    fprintf(stderr, "disk cache: header checksum mismatch, skipped: %s\n", path.c_str());
-                    break;
-                }
-                a.n = n;
-                a.data_off = ftell(f);
-                struct stat stt;
-                if (stat(path.c_str(), &stt) != 0 || (size_t)stt.st_size != a.data_off + a.total) break;
-                a.path = path;
-                a.disk = std::make_shared<DiskState>();
-                a.disk->done = a.disk->ok = true;
-                a.disk->hash = std::move(hs);
-                found.push_back({std::move(a), stt.st_mtime});
-                ok = true;
-            } while (false);
-            fclose(f);
-            (void)ok;
+      struct stat stt;
+      qkva::Header meta;
+      std::vector<char> raw;
+      auto read_field = [&](auto &value) {
+        if (fread(&value, sizeof(value), 1, f) != 1)
+          return false;
+        const char *p = reinterpret_cast<const char *>(&value);
+        raw.insert(raw.end(), p, p + sizeof(value));
+        return true;
+                };
+      bool ok = stat(path.c_str(), &stt) == 0 && stt.st_size >= 0;
+      char magic[8];
+      if (ok && fread(magic, 1, sizeof(magic), f) == sizeof(magic))
+        raw.insert(raw.end(), magic, magic + sizeof(magic));
+      else {
+        fclose(f);
+        continue;
+      }
+      if (memcmp(magic, "QKVA0003", 8) == 0) {
+        KvArchive old;
+        uint32_t old_fl = 0, old_ns = 0, old_ng = 0, old_nh = 0;
+        int32_t old_n = 0;
+        uint64_t old_hh = 0;
+        bool old_ok = read_field(old_fl) && old_fl <= 65536 &&
+                      old_fl <= (size_t)stt.st_size - raw.size();
+        std::string old_fp(old_ok ? old_fl : 0, '\0');
+        if (old_ok) {
+          old_ok = fread(old_fp.data(), 1, old_fl, f) == old_fl &&
+                   old_fp == fingerprint_;
+          raw.insert(raw.end(), old_fp.begin(), old_fp.end());
+        }
+        old_ok = old_ok && read_field(old_n) && old_n > 0 &&
+                 read_field(old_ns) && old_ns <= kMaxSubs;
+        if (old_ok)
+          old.subs.resize(old_ns);
+        for (auto &x : old.subs)
+          if (old_ok)
+            old_ok = read_field(x);
+        old_ok = old_ok && read_field(old_ng) && old_ng == workers_.size();
+        std::vector<uint64_t> old_sizes(old_ok ? old_ng : 0);
+        for (auto &x : old_sizes)
+          if (old_ok)
+            old_ok = read_field(x);
+        old_ok =
+            old_ok && read_field(old_nh) && old_nh == old_ng * (1 + old_ns);
+        old.disk = std::make_shared<DiskState>();
+        old.disk->hash.resize(old_ok ? old_nh : 0);
+        for (auto &x : old.disk->hash)
+          if (old_ok)
+            old_ok = read_field(x);
+        old_ok = old_ok && read_field(old_hh) && old_n <= max_ctx_ &&
+                 raw.size() <= (size_t)stt.st_size &&
+                 (size_t)old_n <= ((size_t)stt.st_size - raw.size()) / 4;
+        if (old_ok)
+          old.toks.resize(old_n);
+        for (auto &x : old.toks)
+          if (old_ok)
+            old_ok = read_field(x);
+        if (old_ok) {
+          std::vector<char> hb;
+          qkva::put(hb, old_n);
+          for (int32_t x : old.subs)
+            qkva::put(hb, x);
+          hb.insert(hb.end(), reinterpret_cast<const char *>(old.toks.data()),
+                    reinterpret_cast<const char *>(old.toks.data()) +
+                        (size_t)old_n * sizeof(int32_t));
+          old_ok = arch_hash(hb.data(), hb.size()) == old_hh;
+        }
+        old.n = old_n;
+        old.split = 0;
+        for (size_t r = 0; old_ok && r < old_sizes.size(); ++r) {
+          const size_t expected =
+              workers_[r]->archive_bytes(0, old.n) +
+              old.subs.size() * workers_[r]->snapshot_bytes();
+          old_ok =
+              old_sizes[r] == expected && old_sizes[r] <= SIZE_MAX - old.total;
+          if (old_ok) {
+            old.sizes.push_back((size_t)old_sizes[r]);
+            old.total += (size_t)old_sizes[r];
+          }
+        }
+        old.data_off = raw.size();
+        if (old_ok && (size_t)stt.st_size == old.data_off + old.total) {
+          old.disk_size = (size_t)stt.st_size;
+          old.path = path;
+          old.disk->done = old.disk->ok = true;
+          found.push_back({std::move(old), stt.st_mtime});
+        }
+        fclose(f);
+        continue;
+      }
+      if (memcmp(magic, "QKVA0004", 8) != 0) {
+        fclose(f);
+        continue;
+      }
+      // decode_file re-reads nothing the magic path skipped (the file is at the magic); a
+      // truncated or corrupt header returns false and is dropped, never a crash
+      if (!qkva::decode_file(f, (size_t)stt.st_size, fingerprint_, workers_.size(),
+                             kMaxSubs, max_ctx_, meta))
+        ok = false;
+      KvArchive a;
+      if (ok) {
+        a.n = meta.n;
+        a.pinned = meta.pinned != 0;
+        a.split = meta.split;
+        a.subs.assign(meta.subs.begin(), meta.subs.end());
+        a.toks.assign(meta.toks.begin(), meta.toks.end());
+        a.data_off = meta.data_off;
+        for (size_t r = 0; r < meta.sizes.size(); ++r) {
+          const size_t expected = workers_[r]->archive_bytes(a.split, a.n) +
+                                  a.subs.size() * workers_[r]->snapshot_bytes();
+          if (meta.sizes[r] != expected || meta.sizes[r] > SIZE_MAX - a.total) {
+            ok = false;
+            break;
+          }
+          a.sizes.push_back((size_t)meta.sizes[r]);
+          a.total += (size_t)meta.sizes[r];
+        }
+      }
+      if (ok && (size_t)stt.st_size == meta.data_off + a.total) {
+        a.disk_size = (size_t)stt.st_size;
+        a.path = path;
+        a.disk = std::make_shared<DiskState>();
+        a.disk->done = a.disk->ok = true;
+        a.disk->hash = std::move(meta.hashes);
+        found.push_back({std::move(a), stt.st_mtime});
+      }
+      fclose(f);
         }
         closedir(dir);
     }
     std::sort(found.begin(), found.end(), [](const Found& x, const Found& y) { return x.mt < y.mt; });
     for (auto& fa : found) {
         fa.a.used = ++tick_;
-        disk_used_ += fa.a.total;
+        disk_used_ += fa.a.disk_size;
         archives_.push_back(std::move(fa.a));
     }
     disk_make_room(0);
@@ -3293,6 +3441,10 @@ void Engine::disk_init() {
 void Engine::persist() {
     finish();
     const int keep = cur_;
+  if (!disk_dir_.empty())
+    for (auto &a : archives_)
+      if (a.pinned && a.sk < 0 && a.path.empty())
+        disk_enqueue(a);
     for (int sl = 0; sl < (int)seqs_.size(); sl++)
         if (seqs_[sl].pos >= archive_min_ && !pf_of(sl)) {  // (not a prompt in flight, e.g. a resume prefilled in pieces)
             use_slot(sl);
@@ -3873,7 +4025,17 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
             best_pos = pos; best_cost = cost; best = sn; best_src = src; best_arch = ar; best_sub = sub;
         };
         auto arch_cost = [&](const KvArchive& a) { return a.pinned && share_prefix_ ? 0 : a.ram ? 2 : 3; };
-        for (auto& sn : snaps_) {
+    auto has_prefix = [&](const KvArchive &a) {
+      if (!a.split)
+        return true;
+      for (const auto &x : archives_)
+        if (x.pinned && x.sk == a.sk && x.n == a.split &&
+            std::equal(x.toks.begin(), x.toks.end(), a.toks.begin()) &&
+            arch_present(x))
+          return true;
+      return false;
+    };
+    for (auto& sn : snaps_) {
             if (sn.sk != sk || sn.pos >= n || lcp_of(sn.toks, ids, n) < sn.pos) continue;
             // this slot's rows (unless they end inside its shared prefix: see the ARCH case)
             if (sn.pos <= kv_ok && sn.pos >= q.split) { consider(sn.pos, 0, &sn, slot, nullptr); continue; }
@@ -3882,22 +4044,39 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
                 if (y != slot && seqs_[y].sk == sk && seqs_[y].pos >= sn.pos && lcp_of(seqs_[y].seq, ids, n) >= sn.pos) y0 = y;
             if (y0 >= 0) { consider(sn.pos, 1, &sn, y0, nullptr); continue; }
             for (auto& a : archives_)
-                if (a.sk == sk && a.n >= sn.pos && (!a.split || prefix_host(a)) && lcp_of(a.toks, ids, n) >= sn.pos)
+                if (a.sk == sk && a.n >= sn.pos && has_prefix(a) && lcp_of(a.toks, ids, n) >= sn.pos)
                     consider(sn.pos, a.ram ? 2 : 3, &sn, -1, &a);
         }
         for (auto& a : archives_) {  // the archive's own state at its end, or a checkpoint in it
-            if (a.sk != sk || (a.split && !prefix_host(a))) continue;
+            if (a.sk != sk || !has_prefix(a)) continue;
             const int l = lcp_of(a.toks, ids, n), c = arch_cost(a);
             if (a.n < n && l >= a.n) consider(a.n, c, nullptr, -1, &a);
             else
                 for (size_t si = 0; si < a.subs.size(); si++)
                     if (a.subs[si] <= l) consider(a.subs[si], c, nullptr, -1, &a, si);
         }
-        if (best_arch && !archive_load(*best_arch)) {  // unreadable file: forget it, recompute
+        if (best_arch && best_arch->split) {
+      KvArchive *dep = nullptr;
+      for (auto &x : archives_)
+        if (x.pinned && x.sk == best_arch->sk && x.n == best_arch->split &&
+            std::equal(x.toks.begin(), x.toks.end(), best_arch->toks.begin())) {
+          dep = &x;
+          break;
+        }
+      if (!dep || !arch_present(*dep) || !archive_load(*dep)) {
+        best = nullptr;
+        best_arch = nullptr;
+      } else {
+        held.add(dep);
+        host_pre = dep;
+      }
+    }
+    if (best_arch && !archive_load(*best_arch)) {  // unreadable file: forget it, recompute
             for (auto it = archives_.begin(); it != archives_.end(); ++it)
                 if (&*it == best_arch) { drop_archive(it); break; }
             best = nullptr;
             best_arch = nullptr;
+      host_pre = nullptr;
         }
         if (best_arch) {
             from = best_pos;
@@ -3923,7 +4102,6 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
                 mode = ARCH;
                 if (best_arch->split) {
                     host_pre = prefix_host(*best_arch);
-                    held.add(host_pre);
                     // attach only if the prompt resumes at or past the prefix end: a slot
                     // attached to a prefix longer than its restored part would read the prefix's
                     // rows past `from` and write keys below split at negative own rows; else
