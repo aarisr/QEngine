@@ -31,7 +31,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -595,6 +598,77 @@ private:
     std::atomic<bool> stop_{false};
     std::thread th_;
     long long n_evicted = 0;
+};
+
+// A bounded single-writer queue. Rejected items are counted; stop() drains by
+// default.
+template <class T> class AsyncWriter {
+public:
+  using WriteFn = void (*)(void *, T &&);
+
+  AsyncWriter(size_t capacity, WriteFn write, void *context)
+      : capacity_(capacity), write_(write), context_(context),
+        worker_([this] { run(); }) {}
+  AsyncWriter(const AsyncWriter &) = delete;
+  AsyncWriter &operator=(const AsyncWriter &) = delete;
+  ~AsyncWriter() { stop(); }
+
+  bool try_push(const T &item) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (stopping_ || queue_.size() >= capacity_) {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      queue_.push_back(item);
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+  void stop(bool drain = true) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!stopping_) {
+        stopping_ = true;
+        if (!drain) {
+          dropped_.fetch_add(queue_.size(), std::memory_order_relaxed);
+          queue_.clear();
+        }
+      }
+    }
+    cv_.notify_all();
+    if (worker_.joinable())
+      worker_.join();
+  }
+
+  uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
+
+private:
+  void run() {
+    for (;;) {
+      std::optional<T> item;
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+        if (queue_.empty())
+          return;
+        item.emplace(std::move(queue_.front()));
+        queue_.pop_front();
+      }
+      write_(context_, std::move(*item));
+    }
+  }
+
+  const size_t capacity_;
+  WriteFn write_;
+  void *context_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<T> queue_;
+  bool stopping_ = false;
+  std::atomic<uint64_t> dropped_{0};
+  std::thread worker_;
 };
 
 // remove this writer's oldest objects until its own total fits; paths are the ones this process published

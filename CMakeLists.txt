@@ -90,6 +90,8 @@ add_custom_target(qe_build_id ALL
 string(REPLACE ";" "," QE_ARCH_STR "${CMAKE_CUDA_ARCHITECTURES}")
 add_compile_definitions(QE_CUDA_ARCHS="${QE_ARCH_STR}")
 find_package(CUDAToolkit REQUIRED)
+# std::thread (async shared-prefix publisher)
+find_package(Threads REQUIRED)
 
 file(GLOB KERNELS CONFIGURE_DEPENDS src/kernels/*.cu)
 add_library(qengine SHARED ${KERNELS} src/capi.cpp src/config.cpp src/safetensors.cpp src/model.cpp src/dflash.cpp src/engine.cpp src/build_id.cpp)
@@ -115,7 +117,7 @@ add_dependencies(flash_run qe_build_id)
 # C API of the Flash-Next engine for the server (server/qe_capi.h tier 0)
 add_library(qflash SHARED src/flash/flash.cu src/flash/flash_seq.cu src/flash/flash_pp.cpp src/flash/card_probe.cu src/flash/flash_capi.cpp src/build_id.cpp $<TARGET_OBJECTS:qkernels>)
 target_include_directories(qflash PRIVATE src)
-target_link_libraries(qflash PRIVATE CUDA::cudart CUDA::cuda_driver)
+target_link_libraries(qflash PRIVATE CUDA::cudart CUDA::cuda_driver Threads::Threads)
 target_include_directories(qflash PRIVATE ${CMAKE_BINARY_DIR}/gen)
 add_dependencies(qflash qe_build_id)
 

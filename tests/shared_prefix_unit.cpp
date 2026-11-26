@@ -2,8 +2,8 @@
 // derivation, round trip, checksum and fingerprint refusal, two-writer races, a
 // writer killed mid-layout, unlink while mapped, the inotify index with a
 // forced rescan, the flock'd evictor, per-writer quota pruning, and the
-// registration-failure fallback. Multi-process cases re-exec this binary with a
-// child argument (no shell, no sleep-based races: children signal readiness on
+// registration-failure fallback, async queue/drop/lifetime, and published-object
+// visibility. Multi-process cases re-exec this binary with a child argument (no
 // a pipe). No GPU: registration is a hook the test installs and can make fail.
 // Measurements (n, p50/p95) cover the CPU-side numbers CI can produce:
 // build/publish, map+verify, attach policy, and the bytes per prefix; the
@@ -19,6 +19,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <utility>
 #include <chrono>
 #include <random>
 #include <string>
@@ -123,6 +128,188 @@ static double q(std::vector<double> v, double p) {
 }
 #include "shared_prefix_crc_test.inc"
 #include "shared_prefix_unlink_test.inc"
+
+// ---- async publication queue fixtures: AsyncWriter takes a plain function
+// pointer plus a context, so its callbacks reach the state through this sink.
+// Two gates park a callback inside the writer (show: before it looks at the
+// item, finish: before it returns), so every ordering here is a
+// condition_variable wait with a bound: no sleep-based ordering and no path
+// that can hang.
+static constexpr char kAwText[] = "prefix-payload";
+
+struct AwSink {
+  std::mutex m;
+  std::condition_variable cv;
+  bool show = true;   // false parks the callback before it inspects the item
+  bool finish = true; // false parks the callback before it returns
+  int entered = 0;    // callbacks that reached the callback body
+  std::vector<int> values;           // completed writes, in callback order
+  std::vector<std::thread::id> tids; // the thread that ran each callback
+  bool payload_intact = false;
+  int alive_at_entry = -1, alive_at_exit = -1;
+  std::string payload_text;
+
+  // bounded predicate wait: false on timeout, so a worker that never runs fails
+  // the test instead of blocking CI
+  template <class F> bool until(double timeout_s, F pred) {
+    std::unique_lock<std::mutex> lock(m);
+    return cv.wait_for(lock, std::chrono::duration<double>(timeout_s), pred);
+  }
+  void show_now() {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      show = true;
+    }
+    cv.notify_all();
+  }
+  void finish_now() {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      finish = true;
+    }
+    cv.notify_all();
+  }
+};
+
+// a payload that counts its live instances, so the test can watch a queued
+// shared_ptr keep it alive until the worker's callback is done with it
+struct AwPayload {
+  explicit AwPayload(std::atomic<int> *live, std::string text)
+      : live(live), text(std::move(text)) {
+    live->fetch_add(1);
+  }
+  ~AwPayload() { live->fetch_add(-1); }
+  std::atomic<int> *live;
+  const std::string text;
+};
+
+static void aw_write_int(void *ctx, int &&v) {
+  AwSink *s = (AwSink *)ctx;
+  {
+    std::unique_lock<std::mutex> lock(s->m);
+    s->tids.push_back(std::this_thread::get_id());
+    s->entered++;
+    s->cv.notify_all(); // bounded waits may already be parked on entered
+    s->cv.wait(lock, [s] { return s->finish; });
+    s->values.push_back(v);
+  }
+  s->cv.notify_all();
+}
+
+static void aw_write_payload(void *ctx, std::shared_ptr<AwPayload> &&p) {
+  AwSink *s = (AwSink *)ctx;
+  {
+    std::unique_lock<std::mutex> lock(s->m);
+    s->tids.push_back(std::this_thread::get_id());
+    s->entered++; // the caller now parks before looking at the item
+    s->cv.notify_all();
+    s->cv.wait(lock, [s] { return s->show; });
+    s->alive_at_entry = p ? p->live->load() : 0;
+    s->payload_intact = p && p->text == kAwText;
+    s->cv.notify_all(); // the entry observations are visible now
+    s->cv.wait(lock, [s] { return s->finish; });
+    s->alive_at_exit = p ? p->live->load() : 0; // still alive mid-callback
+    if (p)
+      s->payload_text = p->text;
+  }
+  s->cv.notify_all();
+}
+
+// ---- async publication of a real object: the queued item owns the Desc and
+// its payload shards, so the worker lays the object out and publishes it
+// itself, and the caller only ever sees it through the public open_map path.
+// One gate parks the callback before it touches the item, so "not published
+// yet" is an ordered observation and never a sleep.
+struct ApJob {
+  ApJob(std::atomic<int> *live, Desc desc,
+        std::vector<std::vector<char>> shards, std::string obj_key)
+      : live(live), d(std::move(desc)), pay(std::move(shards)),
+        k(std::move(obj_key)) {
+    live->fetch_add(1);
+  }
+  ~ApJob() { live->fetch_add(-1); }
+  std::atomic<int> *live;
+  const Desc d;
+  const std::vector<std::vector<char>> pay;
+  const std::string k; // the object key this job publishes under
+};
+
+// the shards folded into one number, so the callback can report the exact
+// bytes it copied without sharing the caller's vectors
+static uint64_t pay_hash(const std::vector<std::vector<char>> &pay) {
+  uint64_t h = 1469598103934665603ull;
+  for (const auto &v : pay)
+    for (const char c : v)
+      h = (h ^ (unsigned char)c) * 1099511628211ull;
+  return h;
+}
+
+struct ApSink {
+  std::mutex m;
+  std::condition_variable cv;
+  bool release = false; // false parks after ownership checks, before publish
+  int entered = 0;      // callbacks that reached the callback body
+  int alive_at_entry = -1, alive_at_exit = -1;
+  bool shards_match = false; // shard count agrees with the description
+  uint64_t seen_hash = 0, seen_bytes = 0; // payload the writer copied
+  bool published = false;                 // publish() returned, either way
+  bool ok = false;
+  int err = 0;
+  std::thread::id worker;
+  std::string path; // where the writer says the object lives
+
+  // bounded predicate wait: false on timeout, so a worker that never runs fails
+  // the test instead of blocking CI
+  template <class F> bool until(double timeout_s, F pred) {
+    std::unique_lock<std::mutex> lock(m);
+    return cv.wait_for(lock, std::chrono::duration<double>(timeout_s), pred);
+  }
+  void release_now() {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      release = true;
+    }
+    cv.notify_all();
+  }
+};
+
+static void ap_publish_job(void *ctx, std::shared_ptr<ApJob> &&job) {
+  ApSink *s = (ApSink *)ctx;
+  {
+    std::unique_lock<std::mutex> lock(s->m);
+    s->worker = std::this_thread::get_id();
+    s->entered++; // report entry while publication is still parked
+    s->alive_at_entry = job ? job->live->load() : 0;
+    s->shards_match = job && job->pay.size() == (size_t)job->d.ng * 2;
+    s->cv.notify_all();
+    s->cv.wait(lock, [s] { return s->release; });
+  }
+  s->cv.notify_all(); // wake the test after the callback returns from its gate
+  if (job) {
+    int err = 0;
+    bool ok = false;
+    {
+      Builder b; // owns the mapping until the object is handed to its key
+      ok = b.create(g_dir, job->d, err);
+      for (int r = 0; ok && r < job->d.ng; r++) {
+        memcpy(b.kv(r), job->pay[2 * r].data(), job->pay[2 * r].size());
+        memcpy(b.st(r), job->pay[2 * r + 1].data(), job->pay[2 * r + 1].size());
+      }
+      if (ok)
+        ok = b.publish(g_dir, job->k, err);
+    }
+    std::lock_guard<std::mutex> lock(s->m);
+    s->seen_hash = pay_hash(job->pay);
+    for (const auto &v : job->pay)
+      s->seen_bytes += v.size();
+    s->ok = ok;
+    s->err = err;
+    s->path = path_of(g_dir, job->k);
+    s->alive_at_exit = job->live->load(); // shards live through the publish
+    s->published = true;
+  }
+  s->cv.notify_all(); // released on every path: the drain and join cannot hang
+}
 
 // ---- child modes (multi-process cases)
 static int child_writer(const std::string &fp, const std::string &steer,
@@ -536,6 +723,139 @@ int main(int argc, char **argv) {
     printf("MEASURE gpu: cudaHostRegister time and H2D DMA bandwidth require a "
            "GPU; pending (GPU 7, <=256 MB, <=60 s, "
            "only at queue 0)\n");
+  }
+
+  // 11. async queue: writes run on the worker thread, never on the caller, one
+  // writer at a time, accepted items keep push order
+  {
+    const std::thread::id caller = std::this_thread::get_id();
+    AwSink sink; // gates open: the callback never parks here
+    uint64_t dropped_before = 0;
+    {
+      AsyncWriter<int> w(4, aw_write_int, &sink);
+      EXPECT(w.try_push(1));
+      EXPECT(w.try_push(2));
+      EXPECT(w.try_push(3));
+      EXPECT(sink.until(5.0, [&] { return sink.entered == 3; }));
+      w.stop(); // drain: every accepted item is written before the join
+      dropped_before = w.dropped();
+      EXPECT(
+          (sink.values == std::vector<int>{1, 2, 3})); // FIFO, single consumer
+      EXPECT(sink.tids.size() == 3);
+      for (size_t i = 0; i < sink.tids.size(); i++) {
+        EXPECT(sink.tids[i] != caller);       // away from the publishing thread
+        EXPECT(sink.tids[i] == sink.tids[0]); // and always the same worker
+      }
+    } // ~AsyncWriter stops again: the second stop must stay clean
+    EXPECT(dropped_before == 0);
+  }
+
+  // 12. bounded queue: a full queue rejects and counts, stop(drain=true) writes
+  // everything already accepted and nothing else
+  {
+    AwSink sink;
+    sink.finish = false; // park the worker inside the first callback
+    size_t accepted = 0;
+    {
+      AsyncWriter<int> w(3, aw_write_int, &sink);
+      EXPECT(w.try_push(1));
+      // the worker has taken item 1 and sits in the callback, so the queue is
+      // empty here and the capacity below is the whole queue
+      EXPECT(sink.until(5.0, [&] { return sink.entered == 1; }));
+      EXPECT(w.try_push(2));
+      EXPECT(w.try_push(3));
+      EXPECT(w.try_push(4)); // queue now holds exactly capacity items
+      EXPECT(w.dropped() == 0);
+      EXPECT(!w.try_push(5)); // full: rejected, not queued
+      EXPECT(w.dropped() == 1);
+      EXPECT(!w.try_push(6));
+      EXPECT(w.dropped() == 2);
+      accepted = 4;
+      sink.finish_now(); // release on every path so the join cannot hang
+      w.stop();          // drain the accepted items, then join
+      EXPECT(sink.values.size() == accepted);
+      EXPECT((sink.values == std::vector<int>{1, 2, 3, 4}));
+      EXPECT(w.dropped() == 2); // the two rejections, and only those
+    }
+  }
+
+  // 13. a queued shared_ptr keeps its payload alive for the whole callback and
+  // is released when the worker is done with it
+  {
+    std::atomic<int> live{0};
+    AwSink sink;
+    sink.show = false;   // park before the callback inspects the item
+    sink.finish = false; // park again before the callback returns
+    {
+      AsyncWriter<std::shared_ptr<AwPayload>> w(2, aw_write_payload, &sink);
+      auto p = std::make_shared<AwPayload>(&live, kAwText);
+      EXPECT(live.load() == 1);
+      EXPECT(w.try_push(p));
+      p.reset();
+      EXPECT(live.load() == 1); // the queue owns the only reference
+      EXPECT(sink.until(5.0, [&] { return sink.entered == 1; }));
+      EXPECT(live.load() == 1); // alive while the worker holds it
+      sink.show_now();          // the callback now reads through the pointer
+      EXPECT(sink.until(5.0, [&] { return sink.alive_at_entry == 1; }));
+      EXPECT(sink.payload_intact); // payload reaches the writer intact
+      EXPECT(live.load() == 1);    // and outlives the inspection
+      sink.finish_now();           // callback returns; release on every path
+      EXPECT(sink.until(5.0, [&] { return sink.alive_at_exit == 1; }));
+      EXPECT(sink.payload_text == kAwText);
+      w.stop();
+      EXPECT(live.load() == 0); // the drained item was released, nothing leaked
+      EXPECT(w.dropped() == 0);
+    }
+    EXPECT(live.load() == 0);
+  }
+
+  // 14. async publication of a real object: the item owns the description and
+  // the shards, the worker builds and publishes on its own thread, and the
+  // object is only visible through open_map once that writer is done
+  {
+    auto t = toks(256, 41);
+    Desc d = make_desc(fp, steer + "-async", t, 2, 1 << 15, 1 << 13);
+    auto pay = payloads(d);
+    const std::string k = key(d.fp, d.steer, d.toks);
+    const std::string want = path_of(g_dir, k);
+    std::atomic<int> live{0};
+    ApSink sink;
+    {
+      AsyncWriter<std::shared_ptr<ApJob>> w(2, ap_publish_job, &sink);
+      auto job = std::make_shared<ApJob>(&live, d, pay, k);
+      EXPECT(live.load() == 1);
+      EXPECT(w.try_push(job));
+      job.reset(); // the queue owns the description and the shards now
+      EXPECT(live.load() == 1);
+      EXPECT(sink.until(5.0, [&] { return sink.entered == 1; }));
+      Map too_early;
+      EXPECT(open_map(want, fp, too_early) == Rd::MISS); // not built yet
+      EXPECT(sink.until(5.0, [&] { return sink.alive_at_entry == 1; }));
+      EXPECT(sink.shards_match);
+      sink.release_now(); // the worker now builds, copies and publishes
+      EXPECT(sink.until(5.0, [&] { return sink.published; }));
+      EXPECT(sink.ok);
+      EXPECT(sink.err == 0);
+      EXPECT(sink.path == want);
+      EXPECT(sink.seen_hash == pay_hash(pay)); // bytes reach the writer intact
+      EXPECT(sink.seen_bytes == ((size_t)d.kv[0].len + d.st[0].len) * 2);
+      EXPECT(sink.alive_at_exit == 1); // and outlive the publish
+      w.stop(); // drain, then join: the callback ran to completion
+      EXPECT(w.dropped() == 0);
+      EXPECT(sink.worker != std::this_thread::get_id()); // away from the caller
+      EXPECT(live.load() == 0); // released with the callback, nothing leaked
+    }
+    Map m;
+    const char *why = "";
+    EXPECT(open_map(want, fp, m, &why) == Rd::OK);
+    EXPECT(m.desc().steer == steer + "-async");
+    EXPECT(m.desc().toks == t);
+    EXPECT(m.desc().ng == 2);
+    EXPECT(m.desc().writer == 7);
+    EXPECT(m.verify_all());
+    EXPECT(same_payload(m, pay));
+    Map other;
+    EXPECT(open_map(want, "other-fingerprint", other) == Rd::OTHER);
   }
 
   cleanup_test_dir();

@@ -3,7 +3,8 @@
 // shards. If registration is unavailable/over budget, copy the mapped shards once into this process's HostPool (logged);
 // if neither path fits the pin budget/headroom, the caller treats this as a miss and prefills.
 Pin* FE::sp_load(const sp::Entry& en, const Pin* keep) {
-    flash_adapter::KeepPin<FE, Pin> keep_guard(this, const_cast<Pin*>(keep));
+    const double t0 = now_ms();
+    flash_adapter::KeepPin<FE, Pin> keep_guard(this, keep);
     auto mp = std::make_shared<sp::Map>();
     const char* why = "";
     if (sp::open_map(en.path, sp_fp, *mp, &why) != sp::Rd::OK) {
@@ -114,6 +115,6 @@ Pin* FE::sp_load(const sp::Entry& en, const Pin* keep) {
     if (log)
         fprintf(stderr, "[qflash] archive: shared prefix %zu tokens (%s, %.2f GB; %.1f ms, %lld hit(s))\n",
                 d.toks.size(), registered_map ? "mmap+registered DMA" : "private copy", need / 1e9,
-                now_ms() - t0, n_sp_hit);
+                now_ms() - t0, n_sp_hit.load());
     return &pins.back();
 }

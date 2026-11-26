@@ -690,6 +690,8 @@ struct FE {
     size_t pin_budget = 0, pin_used = 0;
     long long n_pin = 0, n_pin_hit = 0, n_pin_drop = 0;
     void sp_init(const std::string& model); void sp_publish(const Pin& p); void sp_fail_log(const char* at, int err); bool sp_fits(const sp::Desc& d); Pin* sp_load(const sp::Entry& en, const Pin* keep);
+    std::unique_ptr<sp::AsyncWriter<Pin>> sp_publish_queue;
+    void sp_publish_sync(Pin&& p);
     // archive bytes in use: the host pool minus the pinned prefixes (their own budget)
     size_t aused() const { const size_t u = hpool.used(); return u > pin_used ? u - pin_used : 0; }
     // ckpt_keep: states per conversation, 6 -> 3 with the prompt-end state ([qfn-ttft-pe]): the system end, the
@@ -2694,7 +2696,14 @@ struct FE {
             if (!sl[i].conv && !sl[i].active) return i;
         return -1;
     }
-    ~FE() { flash_adapter::shutdown(this); }
+    ~FE() {
+        if (sp_publish_queue) {
+            sp_publish_queue->stop();
+            fprintf(stderr, "[qflash] shared L2: async publisher stopped (dropped %llu publishes)\n",
+                    (unsigned long long)sp_publish_queue->dropped());
+        }
+        flash_adapter::shutdown(this);
+    }
 };
 #include "sp_capi_impl.inc"
 

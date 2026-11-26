@@ -64,11 +64,37 @@ void FE::sp_init(const std::string& model) {
             sp_dir.c_str(), ino ? "inotify" : "rescan-only", ev ? "this process" : "another", sp_quota / 1e9,
             sp_global / 1e9, pin_cap / 1e9, sp_fp.c_str());
     if (ev) sp_evictor->start(sp_global);
+    const size_t queue_depth = (size_t)std::max(0, env_int("QE_SHARED_L2_PUBLISH_QUEUE", 2));
+    sp_publish_queue = std::make_unique<sp::AsyncWriter<Pin>>(
+        queue_depth,
+        [](void* context, Pin&& queued) {
+            FE* e = (FE*)context;
+            try {
+                e->sp_publish_sync(std::move(queued));
+            } catch (...) {
+                e->sp_fail_log("async publish", EIO);
+            }
+        },
+        this);
+    fprintf(stderr, "[qflash] shared L2: async publisher queue depth %zu\n", queue_depth);
 }
 
+// Queue a copy of the Pin so its shared Seg/State references keep the payload alive through the write.
+void FE::sp_publish(const Pin& p) {
+    if (sp_dir.empty() || !budget || !sp_publish_queue) return;
+    const int P = (int)p.toks.size();
+    if (P <= 0 || p.st->pos != P || p.st->pend || p.st->kind != 1 || p.st->prev_m != 0) return;
+    if (!sp_publish_queue->try_push(p)) {
+        const uint64_t dropped = sp_publish_queue->dropped();
+        if (dropped == 1 || (dropped & (dropped - 1)) == 0)
+            fprintf(stderr, "[qflash] shared L2: async publish queue full (dropped %llu)\n", (unsigned long long)dropped);
+    }
+}
+
+// The single background writer performs the former synchronous publish work.
 // Publish a new pin as one shared object. The bytes are copied from the pin's private host blobs: this is the writer
 // side (once per system prefix); a reader maps the object and DMAs from the shared pages, there is no read() path.
-void FE::sp_publish(const Pin& p) {
+void FE::sp_publish_sync(Pin&& p) {
     if (sp_dir.empty() || !budget) return;
     const int P = (int)p.toks.size();
     if (P <= 0 || p.st->pos != P || p.st->pend || p.st->kind != 1 || p.st->prev_m != 0) return;
@@ -76,7 +102,7 @@ void FE::sp_publish(const Pin& p) {
     sp::Desc d;
     d.fp = sp_fp;
     d.steer = sid;
-    d.toks = p.toks;
+    d.toks = std::move(p.toks);
     d.writer = sp_writer;
     d.ng = ng;
     d.kv.resize(ng);
@@ -120,7 +146,7 @@ void FE::sp_publish(const Pin& p) {
         memcpy(b.kv(r), p.kv->p[r], (size_t)p.kv->n[r]);
         memcpy(b.st(r), p.st->p[r], (size_t)p.st->n[r]);
     }
-    const std::string k = sp::key(sp_fp, sid, p.toks);
+    const std::string k = sp::key(sp_fp, sid, d.toks);
     if (!b.publish(sp_dir, k, err)) return sp_fail_log("publish", err);
     sp_own.push_back(sp::path_of(sp_dir, k));
     sp_own_bytes += need;
@@ -128,7 +154,7 @@ void FE::sp_publish(const Pin& p) {
     if (sp_evictor) sp_evictor->enforce(sp_global);
     if (log || n_sp_write <= 3)
         fprintf(stderr, "[qflash] shared L2: published prefix %d tokens (%zu MB object, %d cards; %.1f ms, %lld written)\n",
-                P, need >> 20, ng, now_ms() - t0, n_sp_write);
+                P, need >> 20, ng, now_ms() - t0, (long long)n_sp_write.load());
 }
 
 bool FE::sp_fits(const sp::Desc& d) {
