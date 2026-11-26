@@ -10,6 +10,7 @@
 #include "../qe_log.h"
 #include "../drv_gate.h"
 #include "ngram_ahead.h"
+#include "kv_arith.h"
 #include "../pool_order.h"
 #include "../kernels/watchdog.cuh"
 #include <dirent.h>
@@ -933,7 +934,7 @@ struct FE {
     }
 
     // ---- KV pool regions (periods of 1536 positions = 512 rows on every card)
-    int periods_for(int tokens) const { return std::max(1, (tokens + period - 1) / period); }
+    int periods_for(std::int64_t tokens) const { return static_cast<int>(flash::kv_math::periods_for_tokens(tokens, period)); }
     // KV in RAM (lazy pinning): the pool may grow to what the host can still pin; never below the regions in use
     void refresh_np() {
         int top = 0;
@@ -1080,8 +1081,9 @@ struct FE {
     bool ensure_region(int s, int tokens, const std::vector<int>& protect = {}) {
         refresh_np();
         Slot& q = sl[s];
-        if (tokens > np * period) return false;
-        const int need = std::min(np, periods_for(tokens + reserve));
+        if (static_cast<std::int64_t>(tokens) > flash::kv_math::capacity_tokens(np, period)) return false;
+        const std::int64_t requested = static_cast<std::int64_t>(tokens) + reserve;
+        const int need = static_cast<int>(std::min<std::int64_t>(np, periods_for(requested)));
         if (q.cap >= need) return true;
         {  // cannot fit next to the slots that are never evicted (active, protected): fail before evicting any
             long long fixed = 0;

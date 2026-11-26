@@ -137,6 +137,11 @@ foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_ord
     endif()
   endif()
 endforeach()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/kv_arith_unit.cpp)
+  add_executable(kv_arith_unit tests/kv_arith_unit.cpp)
+  target_include_directories(kv_arith_unit PRIVATE src)
+  add_test(NAME kv_arith_unit COMMAND kv_arith_unit)
+endif()
 add_executable(shared_prefix_gpu_bench tests/shared_prefix_gpu_bench.cpp)
 target_link_libraries(shared_prefix_gpu_bench PRIVATE CUDA::cudart)
 

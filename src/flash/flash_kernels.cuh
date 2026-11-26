@@ -6,6 +6,7 @@
 
 #include "../kernels/gemv_h16.cuh"
 #include "flash.h"
+#include "kv_arith.h"
 #include "../kernels/watchdog.cuh"  // QE_WD_POLL in the exchange waits (a stranded rank traps instead of hanging)
 
 #ifndef FLASH_HCU_H16
@@ -2098,8 +2099,9 @@ __device__ __forceinline__ void kv_need_ents(const KvPool& kp, unsigned id, size
 // every visible block
 __device__ __forceinline__ void kv_need_range(const Plan& p, int pos, int ns, int& tb0, int& tb1) {
     const int nra = owned_upto(p, pos);
-    tb1 = (nra + IDX_R - 1) / IDX_R;
-    tb0 = ns < 0 ? 0 : owned_upto(p, IDX_R * ((pos + 1) / IDX_R) - 1) / IDX_R;
+    tb1 = static_cast<int>(flash::kv_math::blocks_for_rows(nra, IDX_R));
+    const int complete_end = flash::kv_math::complete_block_end(pos, IDX_R);
+    tb0 = ns < 0 ? 0 : owned_upto(p, complete_end) / IDX_R;
 }
 // the last block of a call advances the call id (thread 0, after the block's entries)
 __device__ __forceinline__ void kv_need_done(const KvPool& kp, unsigned id, unsigned nblocks) {
