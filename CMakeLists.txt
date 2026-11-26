@@ -143,8 +143,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/kv_arith_unit.cpp)
   target_include_directories(kv_arith_unit PRIVATE src)
   add_test(NAME kv_arith_unit COMMAND kv_arith_unit)
 endif()
-add_executable(shared_prefix_gpu_bench tests/shared_prefix_gpu_bench.cpp)
-target_link_libraries(shared_prefix_gpu_bench PRIVATE CUDA::cudart)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/shared_prefix_gpu_bench.cpp)  # the Docker build stage has no tests/
+  add_executable(shared_prefix_gpu_bench tests/shared_prefix_gpu_bench.cpp)
+  target_link_libraries(shared_prefix_gpu_bench PRIVATE CUDA::cudart)
+endif()
 
 # GLM-5.3-Flash engine; only where src/glm is present
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/glm/glm.cu)
