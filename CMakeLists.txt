@@ -38,12 +38,13 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
 endif()
 project(qengine LANGUAGES CXX CUDA)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=znver3")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -lineinfo --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -lineinfo --expt-relaxed-constexpr --extra-device-vectorization -Xptxas -warn-spills")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # build identity (remote diagnosis): the [box] start-up line of Flash-Next and the server's /api/stats `build` /
 # start-up log (build/qe_build.txt next to the libraries, server/app.py version_info). Set at BUILD time, so a
