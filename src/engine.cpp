@@ -1483,7 +1483,7 @@ int Engine::unpark(int h, int k, int* extra) {
             r.spec[0][0] == r.pending) {
             // exact: the pending token, its drafts and the position as parked (review M1), no resync
             pool_->run([&](int w) { workers_[w]->spec_restore(slot, r.pos, r.spec[w].data(), r.k_avail + 1); });
-            q.k_avail = r.k_avail, q.k_blk = r.k_blk;
+            q.k_avail = r.k_avail, q.k_blk = r.k_blk, q.k_dfl = false;
             q.stale = false;
         } else {
             q.k_avail = 0, q.k_blk = false;
@@ -3834,6 +3834,40 @@ int Engine::next_k() {
     return bk;
 }
 
+// [q27-dfa] the block drafts a step of `n` sequences verifies for `slot` (src/df_adapt.h): the count with the most
+// expected tokens per millisecond from the slot's acceptance per depth and its step time; in a batched step the fixed
+// part of the step is shared by its sequences. *probe: one draft more this step (every QE_DF_ADAPT_PROBE steps of the
+// slot; in a batched step one sequence at a time, by its index, so a probe changes one row count of the step's graph).
+int Engine::dfa_kv(int slot, int n, int idx, bool* probe) {
+    qe_dfa::Slot& a = seqs_[slot].dfa;
+    const double c1 = a.row.get_over(dfa_row_.get(cost1_));
+    const double c0 = a.t.known() ? a.t.c0(c1) : cost0_;
+    int& k = a.k[n > 1];
+    k = qe_dfa::pick(a.r, dfa_all_, c0 / n, c1, dfa_min_, kDflDrafts, k);
+    *probe = k < kDflDrafts && (n > 1 ? dfa_probe_ > 0 && (int)(dfa_btick_ % dfa_probe_) == idx % dfa_probe_
+                                      : qe_dfa::probe_due(a.tick++, dfa_probe_));
+    return k + (*probe ? 1 : 0);
+}
+
+void Engine::dfa_observe(Seq& q, int kv, int accepted) {
+    q.dfa.r.observe(kv, accepted);
+    dfa_all_.observe(kv, accepted);
+    dfa_steps_++, dfa_rows_ += kv, dfa_acc_ += std::max(0, std::min(accepted, kv));
+    static const int every = env_int("QE_DF_ADAPT_LOG", 0);  // a line every that many adaptive verifications (0: none)
+    if (every > 0 && dfa_steps_ % every == 0) dfa_log();
+}
+
+void Engine::dfa_log() {
+    int hist[kDflDrafts + 1] = {};
+    for (const Seq& q : seqs_)
+        if (q.active && q.k_dfl) hist[std::max(1, std::min(q.dfa.k[0], kDflDrafts))]++;
+    char h[96] = "";
+    for (int k = 1, o = 0; k <= kDflDrafts; k++) o += snprintf(h + o, sizeof h - o, "%s%d", k > 1 ? "/" : "", hist[k]);
+    fprintf(stderr, "[dfa] %lld block verifications | drafts verified %.2f, accepted %.2f per step (%.0f %%) | row cost %.2f ms%s"
+            " | active slots by count 1..%d: %s\n", dfa_steps_, (double)dfa_rows_ / dfa_steps_, (double)dfa_acc_ / dfa_steps_,
+            dfa_rows_ ? 100.0 * dfa_acc_ / dfa_rows_ : 0.0, dfa_row_.get(cost1_), dfa_row_.w < 3 ? " (default)" : "", kDflDrafts, h);
+}
+
 int Engine::start(const int* ids, int n, int k, unsigned long long affinity, int hint) {
     return start_mm(ids, n, k, affinity, hint, nullptr, 0, nullptr, 0);
 }
@@ -4421,7 +4455,8 @@ int Engine::start_finish_slot(int slot) {
     q.last_tok = q.pending = tok;
     if (q.pen) pool_->run([&](int r) { workers_[r]->pen_host(&tok, 1, n); });  // the first token sits at n
     if (pf.slot < (int)dcopy_.size()) dcopy_[pf.slot] = 0.f;
-    q.k_avail = pf.dfl && !q.constrained && dring_of_[pf.slot] >= 0 ? kDflDrafts : pf.kstart;
+    q.k_dfl = pf.dfl && !q.constrained && dring_of_[pf.slot] >= 0;  // [q27-dfa]
+    q.k_avail = q.k_dfl ? kDflDrafts : pf.kstart;
     q.k_blk = false;  // ([q27-bdfl] set only by a block-drafting batched launch)
     if (pf.dfl && q.constrained) dfl_gap(pf.slot, n);
     lk_slot_ = -1;
@@ -4475,18 +4510,24 @@ void Engine::launch_step(int buf, int base, int lk) {
         mkv_slot_ = cur_;
         buf_mkv_[buf] = true;
     }
-    int kv = clamp_kv(seqs_[cur_], kv0, base);
+    // [q27-dfa] block drafts: as many as pay for this slot (QE_DF_ADAPT), not always all 7
+    bool dprobe = false;
+    const bool dfa = dfa_on_ && !con && lk == 0 && seqs_[cur_].k_dfl && kv0 == kDflDrafts;
+    const int kva = dfa ? dfa_kv(cur_, 1, 0, &dprobe) : kv0;
+    int kv = clamp_kv(seqs_[cur_], kva, base);
     const bool look = lk > 0 && kv > 0;
     if (lk > 0 && !look) kv = 0;
     buf_lk_[buf] = look;
     buf_kv_[buf] = kv;
     buf_clamped_[buf] = kv < kv0;
+    buf_dfa_[buf] = dfa && kv == kva ? (dprobe ? 2 : 1) : 0;  // (cut by the reply's limit: no statistics)
     buf_kd_[buf] = kd;
     epoch_++;
     seqs_[cur_].launches++;
     const bool wd = seqs_[cur_].want_drafts && kd > 0;
     seqs_[cur_].k_avail = kd;
     seqs_[cur_].k_blk = false;
+    seqs_[cur_].k_dfl = blk;
     if (workers_[0]->lsa_on())  // LSA: the graph's mode bit from host state (the catch-up runs in the step's job)
         for (auto& w : workers_) w->lsa_mode(cur_, seqs_[cur_].pos);
     const unsigned* mh = con ? mask_buffer(cur_) : nullptr;
@@ -4688,6 +4729,7 @@ static constexpr int kMaxBatch = kMaxSegs;  // sequences per batched step
 void Engine::launch_batch(int buf, bool ahead) {
     lk_slot_ = -1;  // batched steps do not keep the lookup history
     const int n = bslots_.size();
+    dfa_btick_++;
     int kvs[kMaxBatch];
     // grammar-constrained sequences: (index, masks, spec_io) - the caller's drafts and masks
     std::vector<std::tuple<int, const unsigned*, int*>> con;
@@ -4703,8 +4745,13 @@ void Engine::launch_batch(int buf, bool ahead) {
             if (it != f.end()) base += bkvs_[buf ^ 1][it - f.begin()] + 1;
         }
         // (the room left after a lookup step in flight: its rows may exceed the drafts step_batch made room for)
-        kvs[i] = bkvs_[buf][i] = std::min(clamp_kv(q, kv0, base), std::max(0, q.max_t - base - 1));
+        // [q27-dfa] block drafts: as many as pay for this slot in a step of n sequences (never more than the step's cap)
+        bool dprobe = false;
+        const bool dfa = dfa_on_ && !q.constrained && q.k_dfl && q.k_avail == kDflDrafts;
+        const int kva = dfa ? std::min(kv0, dfa_kv(bslots_[i], n, i, &dprobe)) : kv0;
+        kvs[i] = bkvs_[buf][i] = std::min(clamp_kv(q, kva, base), std::max(0, q.max_t - base - 1));
         bclamp_[buf][i] = kvs[i] < kv0;
+        bdfa_[buf][i] = dfa && kvs[i] == kva ? (dprobe ? 2 : 1) : 0;
         if (q.constrained) con.emplace_back(i, mask_buffer(bslots_[i]), spec_io(bslots_[i]));
     }
     // lookup drafts (QE_LKB): slots in lookup mode verify the drafts their history found at the end of their last
@@ -4885,6 +4932,7 @@ void Engine::launch_batch(int buf, bool ahead) {
         bkdn_[buf][i] = dring[i] >= 0 ? kDflDrafts : kd;
         q.k_avail = bkdn_[buf][i];
         q.k_blk = dring[i] >= 0;
+        q.k_dfl = dring[i] >= 0;
     }
     for (auto& c : con) std::get<2>(c)[0] = kd;
     const std::vector<int> kv(kvs, kvs + n), lkv(lkr, lkr + n), kavv(kav, kav + n);
@@ -5113,6 +5161,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         const bool bstep = bblk_[bbuf_][from[i]] && !lkstep;
         if (!q.constrained && !bclamp_[bbuf_][from[i]] && !lkstep && !bstep) observe(bkvs_[bbuf_][from[i]], c - 1);
         if (bstep) df_steps_++, df_tok_ += c;
+        if (bdfa_[bbuf_][from[i]] && !lkstep) dfa_observe(q, bkvs_[bbuf_][from[i]], c - 1);  // [q27-dfa]
         if (lkb_on_) {
             const int s = sl[i];
             if (lkb_len_[s] >= 0) lkb_len_[s] += c;
@@ -5263,6 +5312,15 @@ int Engine::spec_step(int* out) {
     if (dfl_on_) {  // the slot's copy signal
         if ((int)dcopy_.size() < (int)seqs_.size()) dcopy_.resize(seqs_.size(), 0.f);
         dcopy_[cur_] = 0.8f * dcopy_[cur_] + (buf_lk_[buf_] ? 0.2f : 0.f);
+    }
+    if (buf_dfa_[buf_]) {  // [q27-dfa] block drafts verified at the slot's count: their acceptance, and the step's time
+        dfa_observe(q, buf_kv_[buf_], cnt - 1);
+        if (buf_blk_[buf_] && !buf_captured_[buf_]) {  // (not an MTP-drafting step, nor one with host time in it)
+            float ms = 0.f;
+            double smp = 0;
+            if (cudaEventElapsedTime(&ms, tstart_[buf_], emit_ev_[buf_]) != cudaSuccess) cudaGetLastError();
+            else if (q.dfa.t.add(buf_kv_[buf_], ms, buf_dfa_[buf_] == 2, &smp)) q.dfa.row.add(smp), dfa_row_.add(smp);
+        }
     }
     if (!q.constrained && !buf_lk_[buf_] && !buf_blk_[buf_]) {  // kd = 0 / lookup / block steps would skew the MTP statistics / step-time model
         if (!buf_clamped_[buf_]) observe(buf_kv_[buf_], cnt - 1);  // capped drafts: biased
@@ -5629,6 +5687,7 @@ void Engine::decode_calibrate() {
         Engine* e;
         double an[kMaxSpecK + 2], ad[kMaxSpecK + 2], rs[5], c0, c1;
         int adapt, kh;
+        bool dfa;  // [q27-dfa] block steps verify all 7 drafts in the legs, and the legs leave no block statistics
         long long lks, lkr, lkt, sa, n[6], lb[5];
         std::vector<std::array<long long, 5>> ds;
         explicit Keep(Engine* x) : e(x) {
@@ -5641,10 +5700,12 @@ void Engine::decode_calibrate() {
             const long long* l[5] = {&e->lkb_steps_, &e->lkb_rows_sum_, &e->lkb_tok_, &e->lkb_bsteps_, &e->lkb_slotsteps_};
             for (int i = 0; i < 5; i++) lb[i] = *l[i];
             e->adapt_ = 0;
+            dfa = e->dfa_on_, e->dfa_on_ = false;
         }
         ~Keep() {
             memcpy(e->acc_num_, an, sizeof an), memcpy(e->acc_den_, ad, sizeof ad), memcpy(e->rs_, rs, sizeof rs);
             e->cost0_ = c0, e->cost1_ = c1, e->adapt_ = adapt, e->k_heur_ = kh;
+            e->dfa_on_ = dfa;
             e->lk_steps_ = lks, e->lk_rows_ = lkr, e->lk_tok_ = lkt, e->steps_all_ = sa;
             long long* m[6] = {&e->n_grow_, &e->n_move_, &e->n_evict_, &e->n_pause_, &e->n_unpause_, &e->n_release_};
             for (int i = 0; i < 6; i++) *m[i] = n[i];
@@ -5920,6 +5981,16 @@ void Engine::dfl_init(const std::string& model_dir, int req_ctx) {
     }
     drings_.assign(rings, DRing{});
     dfl_on_ = true;
+    // [q27-dfa] QE_DF_ADAPT: a step verifies as many block drafts as pay (0: always all 7, as before). Default on with
+    // more than one card; off on one card, where 8-row steps also carry the drafter's second choices (QE_DF_SIB) and
+    // nothing was measured.
+    static_assert(qe_dfa::kDepth == kDflDrafts, "df_adapt.h depth");
+    dfa_on_ = env_int("QE_DF_ADAPT", workers_.size() > 1 ? 1 : 0) != 0;
+    dfa_min_ = std::max(1, std::min(kDflDrafts, env_int("QE_DF_ADAPT_MIN", 2)));
+    dfa_probe_ = std::max(0, env_int("QE_DF_ADAPT_PROBE", 16));
+    if (dfa_on_)
+        printf("DFlash2 drafts: a step verifies %d..%d of the 7, by each conversation's acceptance and step time "
+               "(QE_DF_ADAPT=1; a probe every %d steps; QE_DF_ADAPT=0: always 7)\n", dfa_min_, kDflDrafts, dfa_probe_);
     printf("DFlash2 drafter: %s, %s (codebooks %.2f GB pinned host memory)\n", file.c_str(),
            drafter_ == 1 ? "every single-sequence step (QE_DRAFTER=dflash2)" : df_batch_ > 0 ? "single-sequence steps and batched steps of <= QE_DF_BATCH sequences (QE_DRAFTER=auto)" : "single-sequence steps, MTP in batched steps (QE_DRAFTER=auto)",
            cb_gb);

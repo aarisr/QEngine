@@ -1,5 +1,6 @@
 #pragma once
 #include "archive_order.h"
+#include "df_adapt.h"
 #include "gpu_others.h"
 #include <mutex>
 #include "host_mem.h"
@@ -366,6 +367,8 @@ private:
         unsigned long long used = 0, affinity = 0;
         int k_avail = 0;            // drafts in the slot's device tokens for its next step
         bool k_blk = false;         // [q27-bdfl] those drafts came from the DFlash2 block drafter
+        bool k_dfl = false;         // [q27-dfa] those drafts are block drafts (single-sequence or batched launch)
+        qe_dfa::Slot dfa;           // [q27-dfa] the slot's block-draft acceptance, step time and verify count
         bool active = false;        // in use by a generating request
         bool stale = false;         // device token/position invalid (queued step undone)
         int prio = 1;               // scheduling value (set_prio): logs and slot_info only, no order reads it
@@ -454,6 +457,20 @@ private:
     int bkdn_[2][kMaxSegs] = {};
     bool bblk_[2][kMaxSegs] = {};        // the sequence's drafts for that step came from the block drafter
     int df_batch_ = 0;                   // QE_DF_BATCH: up to this many sequences in a batched step draft with the block
+    // [q27-dfa] QE_DF_ADAPT: a step verifies as many of a slot's block drafts as pay (src/df_adapt.h), not always 7
+    bool dfa_on_ = false;
+    int dfa_min_ = 2, dfa_probe_ = 16;   // QE_DF_ADAPT_MIN, QE_DF_ADAPT_PROBE
+    qe_dfa::Rates dfa_all_;              // every slot's block-draft acceptance (the prior of a slot)
+    qe_dfa::RowCost dfa_row_;            // every slot's row-cost samples
+    unsigned long long dfa_btick_ = 0;   // batched launches (staggers the probes of a step's sequences)
+    char buf_dfa_[2] = {0, 0};           // the step in each buffer verified an adaptive count (1; 2: a probe)
+    char bdfa_[2][kMaxSegs] = {};        // ... per sequence of the batched step in each buffer
+    int dfa_kv(int slot, int n, int idx, bool* probe);  // drafts to verify: slot, sequences in the step, its index
+    void dfa_observe(Seq& q, int kv, int accepted);
+    void dfa_log();
+  public:
+    long long dfa_steps_ = 0, dfa_rows_ = 0, dfa_acc_ = 0;  // adaptive block verifications: steps, drafts verified / accepted
+  private:
     std::vector<int> lkb_len_, lkb_miss_;
     std::vector<char> lkb_dirty_, lkb_mode_;
     std::vector<float> lkb_ema_;           // accepted lookup drafts per lookup step (EMA): sizes the slot's rows
