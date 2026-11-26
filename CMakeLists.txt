@@ -121,7 +121,7 @@ add_dependencies(qflash qe_build_id)
 
 # CPU unit tests of the comm rules and the exchange flag protocol (no GPU): ctest
 enable_testing()
-foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit disk_eager_unit qfn_pp_plan_unit load_drop_unit host_pressure_unit)
+foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit disk_eager_unit qfn_pp_plan_unit load_drop_unit shared_prefix_unit host_pressure_unit)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)  # the Docker build stage has no tests/
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE src)
@@ -129,12 +129,14 @@ foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_ord
     if(t STREQUAL load_drop_unit)
       target_sources(${t} PRIVATE src/safetensors.cpp)
     endif()
-    if(t STREQUAL kv_disk_unit OR t STREQUAL drv_gate_unit OR t STREQUAL host_pressure_unit)
+    if(t STREQUAL kv_disk_unit OR t STREQUAL drv_gate_unit OR t STREQUAL host_pressure_unit OR t STREQUAL shared_prefix_unit)
       find_package(Threads REQUIRED)
       target_link_libraries(${t} PRIVATE Threads::Threads)
     endif()
   endif()
 endforeach()
+add_executable(shared_prefix_gpu_bench tests/shared_prefix_gpu_bench.cpp)
+target_link_libraries(shared_prefix_gpu_bench PRIVATE CUDA::cudart)
 
 # GLM-5.3-Flash engine; only where src/glm is present
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/glm/glm.cu)

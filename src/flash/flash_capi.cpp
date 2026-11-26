@@ -16,6 +16,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/random.h>
 #include <cerrno>
 #include <csignal>
 #include <limits.h>
@@ -55,6 +56,7 @@
 #include "kv_evict.h"
 #include "host_slabs.h"
 #include "kv_disk.h"
+#include "flash_adapter.h"
 #include "../host_mem.h"
 #include "../host_budget.h"
 [[noreturn]] void qe_wd_host_timeout(const char* what);  // kernels/watchdog.cu: report + exit 75
@@ -687,6 +689,7 @@ struct FE {
     std::list<Pin> pins;          // pinned system-end prefixes (FLASH_PREFIX_GB; needs the archive)
     size_t pin_budget = 0, pin_used = 0;
     long long n_pin = 0, n_pin_hit = 0, n_pin_drop = 0;
+    void sp_init(const std::string& model); void sp_publish(const Pin& p); void sp_fail_log(const char* at, int err); bool sp_fits(const sp::Desc& d); Pin* sp_load(const sp::Entry& en, const Pin* keep);
     // archive bytes in use: the host pool minus the pinned prefixes (their own budget)
     size_t aused() const { const size_t u = hpool.used(); return u > pin_used ? u - pin_used : 0; }
     // ckpt_keep: states per conversation, 6 -> 3 with the prompt-end state ([qfn-ttft-pe]): the system end, the
@@ -2036,6 +2039,7 @@ struct FE {
         fprintf(stderr, "[qflash] archive: pinned system prefix %d tokens of slot %d (%.2f GB: KV %.2f + state %.2f; "
                         "pinned %.2f of %.2f GB, %zu prefixes, %.1f ms)\n", pos, s, need / 1e9, (need - blob_bytes(*st)) / 1e9,
                 blob_bytes(*st) / 1e9, pin_used / 1e9, pin_budget / 1e9, pins.size(), now_ms() - t0);
+        sp_publish(pins.back());
     }
     // ---- the disk cache (--disk-cache, kv_disk.h): a tier under the host archive. Null: off,
     // and none of the code below runs. Only this thread (the scheduler's) touches the index; the writer gets immutable blobs and
@@ -2541,6 +2545,7 @@ struct FE {
     // best cached start for ids[0, n): conversation, positions reused, state to load (null: the live end of a slot);
     // maxm: the longest common prefix with any known sequence (a divergence point worth a checkpoint)
     struct Src { Conv* c = nullptr; int L = 0; std::shared_ptr<State> st; bool live = false; int maxm = 0; Pin* pin = nullptr; };
+    Pin* sp_best(const int* ids, int n, const Src& b, const Pin* keep);
     Src best(const int* ids, int n, bool any_slot) {
         const long long sk = steer_key();
         Src b;
@@ -2582,6 +2587,7 @@ struct FE {
             b.pin = &x;
             brank = -1;
         }
+        if (Pin* x = sp_best(ids, n, b, b.pin)) { maxm = std::max(maxm, (int)x->toks.size()); b = Src{nullptr, (int)x->toks.size(), x->st, false}; b.pin = x; }
         b.maxm = maxm;
         return b;
     }
@@ -2688,7 +2694,9 @@ struct FE {
             if (!sl[i].conv && !sl[i].active) return i;
         return -1;
     }
+    ~FE() { flash_adapter::shutdown(this); }
 };
+#include "sp_capi_impl.inc"
 
 // [qfn-pf-bgap] the engine's n-gram rows helper (next batch's rows during the current batch)
 static void ra_make(FE* e) {
@@ -4139,6 +4147,7 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
             e->par_json = e->par_json.substr(0, e->par_json.size() - 1) + ", \"decode_collectives\": {\"single\": \"" + nm(d0) + "\", \"batched\": \"" + nm(d1) + "\"}}";
     }
     e->dk_init(model);
+    e->sp_init(model);
     if (!e->ppb && flash_ng::RowsAhead::enabled() && env_int("FLASH_PFB", 1) != 0) {  // (pinned rows for base batches now)
         ra_make(e);
         e->ra->reserve(e->W[0]->pf_batch_base());
