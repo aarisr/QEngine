@@ -10,6 +10,12 @@
 
 namespace qe_pool {
 
+// Request classes (QoS, bead 2b03): 0 interactive (default), 1 background. A background start
+// never pauses an interactive decoder; the pause order inside a class stays the most recently
+// admitted first (Engine::pause_for).
+constexpr int kClassInteractive = 0, kClassBackground = 1;
+inline bool pausable_by(int caller_cls, int seq_cls) { return caller_cls != kClassBackground || seq_cls != kClassInteractive; }
+
 // admit / pause ticks are unique per engine, so these orders are strict
 inline bool pauses_first(unsigned long long admit_a, unsigned long long admit_b) { return admit_a > admit_b; }
 inline bool resumes_first(unsigned long long paused_a, unsigned long long paused_b) { return paused_a < paused_b; }

@@ -204,12 +204,14 @@ public:
     // make room for a new n-token sequence: pause decoding sequences in the pool's own order (the most
     // recently admitted first, as room_or_pause; never a prompt being prefilled), only as many as needed
     // and only when that makes it fit (paused conversations count as out: they resume when room frees).
-    // true: the start fits now. `prio` is ignored (user decision 2026-11-12: no priority; the C API keeps it).
-    bool pause_for(int n, int prio);
+    // true: the start fits now. `cls`: the caller's request class (0 interactive, 1 background);
+    // a background start never pauses an interactive decoder (otherwise user decision 2026-11-12 kept).
+    bool pause_for(int n, int cls);
     // Scheduling value of a slot's conversation (0 = finished subagent, 1 = normal, 2 = the main
     // thread): logs and slot_info only; no eviction, archive, pin, snapshot or pause order reads it
     // (user decision 2026-11-12: every conversation alike).
     void set_prio(int slot, int prio) { seqs_.at(slot).prio = prio; }
+    void set_class(int slot, int cls) { seqs_.at(slot).cls = cls; }  // QoS class: 0 interactive, 1 background
     // the reply may emit at most `tokens` more tokens (max_tokens): steps verify only the drafts
     // that fit, so the slot ends exactly at the returned reply and the next turn resumes from its
     // live end (cleared by release / the next prompt)
@@ -367,6 +369,7 @@ private:
         bool active = false;        // in use by a generating request
         bool stale = false;         // device token/position invalid (queued step undone)
         int prio = 1;               // scheduling value (set_prio): logs and slot_info only, no order reads it
+        int cls = 0;                // request class (set_class): 0 interactive, 1 background; pause_for never pauses an interactive decoder for a background start
         int hint = 0;               // end of the system part in its last prompt (0: none), archive_subs keeps a state there
         int plen = 0;               // length of its last prompt (start_begin): rows past it are that prompt's reply
         bool constrained = false;   // grammar mask on (constrain)

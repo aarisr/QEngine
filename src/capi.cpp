@@ -273,7 +273,7 @@ int qe_host_mem_info(void* e, char* buf, int n) {
     return (int)j.size();
 }
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
-int qe_pause_for(void* e, int n, int prio) { return ((Engine*)e)->pause_for(n, prio) ? 1 : 0; }
+int qe_pause_for(void* e, int n, int cls) { return ((Engine*)e)->pause_for(n, cls) ? 1 : 0; }
 // [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
 int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
 int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }
@@ -287,6 +287,7 @@ int qe_drv_gate(int on) {
 }
 int qe_num_parked(void* e) { return ((Engine*)e)->num_parked(); }
 void qe_set_prio(void* e, int slot, int prio) { ((Engine*)e)->set_prio(slot, prio); }
+void qe_set_class(void* e, int slot, int cls) { ((Engine*)e)->set_class(slot, cls); }
 void qe_set_limit(void* e, int slot, int tokens) { ((Engine*)e)->set_limit(slot, tokens); }
 void qe_watch_stops(void* e, int slot, int on) { ((Engine*)e)->watch_stops(slot, on != 0); }
 void qe_set_no_ahead(void* e, int slot, int on) { ((Engine*)e)->set_no_ahead(slot, on != 0); }

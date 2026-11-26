@@ -1671,7 +1671,7 @@ static size_t seq_headroom(size_t ah, int pos, int end) {
     return std::min(ah, left + 1024);
 }
 
-bool Engine::pause_for(int n, int /*prio: ignored, user decision 2026-11-12*/) {
+bool Engine::pause_for(int n, int cls) {
     const size_t ah = admit_headroom();
     if (n > max_ctx_) return false;
     bool slot = false;
@@ -1685,14 +1685,15 @@ bool Engine::pause_for(int n, int /*prio: ignored, user decision 2026-11-12*/) {
         else if (!q.paused) {
             const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + seq_headroom(ah, q.pos, q.rlim), max_ctx_));
             used += u;
-            if (q.max_t > 0 && q.pos > q.split) vs.push_back({(int)i, u});
+            if (q.max_t > 0 && q.pos > q.split && qe_pool::pausable_by(cls, q.cls)) vs.push_back({(int)i, u});
         }
     }
     for (auto& p : pres_) used += units(p.n);
     const size_t need = units(std::min<size_t>((size_t)n + ah, max_ctx_));
     if (!slot) return false;  // every slot is taken: pausing frees no slot
     if (used + need <= pool_tokens_) return true;
-    // the pool's own preemption order (room_or_pause): the most recently admitted first, every conversation alike
+    // the pool's own preemption order (room_or_pause): the most recently admitted first, every conversation
+    // alike within its class (a background caller only sees background decoders, never an interactive one)
     std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) { return qe_pool::pauses_first(seqs_[a.j].admit, seqs_[b.j].admit); });
     size_t k = 0, left = used;
     while (k < vs.size() && left + need > pool_tokens_) left -= vs[k++].u;

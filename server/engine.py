@@ -68,6 +68,7 @@ SIGS = {
     "qe_step_batch": (None, [c_void_p, P_int, c_int, P_int, P_int]),
     "qe_probe_cached": (c_int, [c_void_p, P_int, c_int]),
     "qe_set_prio": (None, [c_void_p, c_int, c_int]),
+    "qe_set_class": (None, [c_void_p, c_int, c_int]),
     "qe_num_pinned": (c_int, [c_void_p]),
     "qe_archive_more": (c_int, [c_void_p, c_i64]),
     "qe_persist": (None, [c_void_p]),
@@ -565,14 +566,15 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         if "qe_protect_ids" in self.fns:
             self.lib.qe_protect_ids(self.h, None, 0)
 
-    def pause_for(self, n, prio):
-        """Pause decoding sequences (never a prefill), the most recently admitted first (src/pool_order.h; prio is
-        not read), until a new sequence of n tokens fits; True: it fits now (nothing is paused when it cannot be
-        made to fit). Paused sequences are not counted as used here (can_admit counts them): the caller must not
-        call it while one is paused, or the newcomer takes the room the paused one waits for."""
+    def pause_for(self, n, cls):
+        """Pause decoding sequences (never a prefill), the most recently admitted first (src/pool_order.h; class-based
+        pause, 1.6.1: a background cls (1) never pauses an interactive decoder (0)), until a new sequence of n tokens
+        fits; True: it fits now (nothing is paused when it cannot be made to fit). Paused sequences are not counted as
+        used here (can_admit counts them): the caller must not call it while one is paused, or the newcomer takes the
+        room the paused one waits for."""
         if "qe_pause_for" not in self.fns:
             return False
-        return bool(self.lib.qe_pause_for(self.h, int(n), int(prio)))
+        return bool(self.lib.qe_pause_for(self.h, int(n), int(cls)))
 
     def set_limit(self, slot, tokens):
         """The reply of the slot may emit at most `tokens` more tokens (max_tokens): its steps
@@ -659,6 +661,12 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         """Eviction value of the slot's conversation: 0 finished, 1 normal, 2 main thread."""
         if "qe_set_prio" in self.fns:
             self.lib.qe_set_prio(self.h, int(slot), int(prio))
+
+    def set_class(self, slot, cls):
+        """QoS class of the slot's request: 0 / "interactive" (default) or 1 / "background". A background start
+        never pauses an interactive decoder (qe_pause_for); the order inside a class is unchanged."""
+        if "qe_set_class" in self.fns:
+            self.lib.qe_set_class(self.h, int(slot), 1 if cls in (1, "background") else 0)
 
     def probe_cached(self, ids):
         """Prompt tokens a start() of ids would resume from now (no side effects)."""

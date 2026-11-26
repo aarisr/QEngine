@@ -62,9 +62,13 @@ class Metrics:
     def _bucket(sec):
         return {"t": sec, "dec": 0, "pre": 0, "active": 0, "queued": 0, "power": 0.0}
 
-    def queued(self, job, label, images=0, image_tokens=0):
+    def queued(self, job, label, images=0, image_tokens=0, cls=None):
+        # x-request-class: job.cls 1 means "background", anything else "interactive"
+        if cls is None:
+            cls = "background" if getattr(job, "cls", 0) == 1 else "interactive"
         with self.lock:
-            self.jobs[id(job)] = {"label": label, "state": "queued", "prompt": len(job.ids),
+            self.jobs[id(job)] = {"label": label, "state": "queued", "class": cls,
+                                  "prompt": len(job.ids),
                                   "t_q": time.time(), "gen": 0, "cached": 0, "slot": -1,
                                   "ev": collections.deque()}  # (t, tokens) of its steps, last 10 s
             self.session["requests"] += 1
@@ -256,6 +260,10 @@ class Metrics:
             jobs = []
             for j in self.jobs.values():
                 jobs.append(self._job_view(j, now))
+            queued_by_class = {"interactive": 0, "background": 0}
+            for j in self.jobs.values():
+                if j["state"] == "queued":
+                    queued_by_class[j.get("class", "interactive")] += 1
             while self.ended and self.ended[0][0] < now - 10:
                 self.ended.popleft()
             sm = sorted(self.step_ms)
@@ -265,7 +273,8 @@ class Metrics:
                          "tok_s_60": self._rate(60, now),
                          "step_ms": sm[len(sm) // 2] if sm else 0,
                          "tokens_per_step": s["gen_tokens"] / s["seq_steps"] if s["seq_steps"] else 0},
-                "jobs": jobs, "ended": [x for _, x in self.ended], "recent": list(self.last_done)[::-1],
+                "jobs": jobs, "queued_by_class": queued_by_class,
+                "ended": [x for _, x in self.ended], "recent": list(self.last_done)[::-1],
                 "session": s, "global": g, "records": dict(self.records), "session_records": dict(self.srec),
                 "engine": self.engine, "gpus": self.gpus, "history": list(self.hist)[-300:],
             }
@@ -301,6 +310,9 @@ class Metrics:
         m("decode_tokens_per_second", round(s["rate"]["tok_s_10"], 2), "decode rate (10 s)")
         m("active_sequences", sum(1 for j in s["jobs"] if j["state"] != "queued"), "sequences running")
         m("queued_requests", sum(1 for j in s["jobs"] if j["state"] == "queued"), "requests waiting")
+        for cls in ("interactive", "background"):
+            m("queued_by_class", s["queued_by_class"][cls], f"requests waiting (class {cls})",
+              labels=f'{{class="{cls}"}}')
         if en:
             m("kv_pool_tokens", en["pool_tokens"], "KV pool capacity (tokens)")
             m("kv_used_tokens", sum(x["pos"] for x in en["slots"]), "tokens held in the KV pool")

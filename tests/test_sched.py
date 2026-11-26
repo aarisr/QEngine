@@ -37,8 +37,8 @@ class FakeEngine:
         paused = sum(self.active[s][0] for s in self.paused)  # paused ones resume first
         return len(self.active) < self.nslots and self.used() + paused + n <= self.pool
 
-    def pause_for(self, n, prio):
-        self.calls.append((n, prio))
+    def pause_for(self, n, cls):
+        self.calls.append((n, cls))
         if len(self.active) >= self.nslots:
             return False
         vs = sorted((s for s, (t, a, pf) in self.active.items() if not pf and s not in self.paused),
@@ -54,10 +54,10 @@ class FakeEngine:
         return True
 
 
-def job(n, prio=1, waited=0.0, now=1000.0):
+def job(n, prio=1, waited=0.0, now=1000.0, cls=0):
     ids = app.Ids(range(n))
     return types.SimpleNamespace(ids=ids, prio=prio, t_enq=now - waited, est=None, t_est=0.0, p={}, slot=-1,
-                                 cut_at=None)
+                                 cut_at=None, cls=cls)
 
 
 def gen(engine, queue, **kw):
@@ -178,7 +178,7 @@ check("a pause that failed halfway: not admitted, but counted and the current sl
 
 print("cut-in on a long prefill in progress (--long-share 0): by size only")
 e = FakeEngine(10 ** 6)
-long_sub = types.SimpleNamespace(ids=list(range(100000)), slot=0, cut_at=None, prio=1)
+long_sub = types.SimpleNamespace(ids=list(range(100000)), slot=0, cut_at=None, prio=1, cls=0)
 g, adm = gen(e, [job(30000, prio=2)])
 check("a 30K main-thread prompt does not cut in on a long subagent prefill", adm.admit_next(NOW, [long_sub]), None)
 g, adm = gen(e, [job(30000)])
@@ -207,7 +207,7 @@ class FakeMulti(FakeEngine):
 
 
 def inflight(n, slot, pos, prio=2, waited=0.0):
-    return types.SimpleNamespace(ids=list(range(n)), slot=slot, cut_at=None, prio=prio, t_enq=NOW - waited, round_tok=0)
+    return types.SimpleNamespace(ids=list(range(n)), slot=slot, cut_at=None, prio=prio, t_enq=NOW - waited, round_tok=0, cls=0)
 
 
 def batch(e, order, T=4096, PFM=512, caps=None):

@@ -50,8 +50,9 @@ long long qe_pool_tokens(void* e);           // KV pool size in tokens, all slot
 int qe_kv_in_ram(void* e);                   // 1: the KV cache lives in host RAM (Flash-Next FLASH_KV=ram); default 0 (VRAM)
 int qe_host_mem_info(void* e, char* buf, int n);  // the host-RAM plan at boot as JSON (/api/stats host_memory); -1: too small
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context
-int qe_pause_for(void* e, int n, int prio);  // pause decoding sequences of lower prio (lowest first, never a prefill) until a
-                                             // new n-token sequence fits; 1: it fits now (nothing paused if it cannot)
+int qe_pause_for(void* e, int n, int cls);  // pause decoding sequences of lower cls (lowest first, never a prefill; a
+                                             // background caller cannot pause an interactive decoder) until a new n-token
+                                             // sequence fits; 1: it fits now (nothing paused if it cannot)
 void qe_protect_ids(void* e, const int* ids, int n);  // [ink-archprot] the prompt the next qe_pause_for / qe_park makes room
                                              // for: its host-store source is kept if the copies fit without it (Inkling); optional
 // park a decoding sequence (KV rows + recurrent state to a held host archive, slot released): handle >= 0, -1 refused;
@@ -100,6 +101,7 @@ void qe_step_batch(void* e, const int* slots, int n, int* out, int* cnt);
 // ======================================================= TIER 4 "cache": prompt cache bookkeeping (all or none)
 int qe_probe_cached(void* e, const int* ids, int n);  // tokens a start would reuse, no side effects
 void qe_set_prio(void* e, int slot, int prio);        // eviction value 0 finished, 1 normal, 2 main agent
+void qe_set_class(void* e, int slot, int cls);      // request class 0 interactive, 1 background; separate from prio
 int qe_num_pinned(void* e);
 int qe_last_copied(void* e);        // prompt tokens of the last start copied from another slot
 int qe_last_from_archive(void* e);  // last start restored from the host archive

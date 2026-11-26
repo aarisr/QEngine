@@ -339,6 +339,7 @@ struct Conv {
     std::vector<std::shared_ptr<State>> ck;   // committed states at positions <= kv_n (resident: <= live tokens)
     int prio = 1;                             // scheduling value of its latest request (0 finished, 1 normal, 2 main thread): logs and
                                               // qe_slot_info only; no eviction, reclaim or pause order reads it (user decision 2026-11-12)
+    int cls = qe_pool::kClassInteractive;     // QoS class: 0 interactive, 1 background
     unsigned long long used = 0, affinity = 0;
     double t_used = 0;                        // wall clock of its last use (s, steady): the idle time in the event lines
     long long steer = -1;                     // steering key it was computed with (FE::steer_key): KV / states never serve another
@@ -6277,7 +6278,7 @@ int qe_can_admit(void* p, int n) {
 // room for a new n-token sequence: pause decoding sequences in the pool's own order (the most recently admitted first, as
 // room_or_pause; never a prompt being prefilled), only as many as needed and only when that makes it fit (paused ones count
 // as out: they resume when room frees). 1: fits now. `prio` is ignored (user decision 2026-11-12; the C API keeps it)
-int qe_pause_for(void* p, int n, int /*prio*/) {
+int qe_pause_for(void* p, int n, int cls) {
     FE* e = (FE*)p;
     e->refresh_np();
     if (!e->batch_api || !e->budget || (int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
@@ -6289,7 +6290,7 @@ int qe_pause_for(void* p, int n, int /*prio*/) {
         act++;
         if (q.paused) continue;
         used += q.cap;
-        if (q.conv && q.cap && q.pending >= 0 && !e->prefilling(i)) vs.push_back(i);
+        if (q.conv && q.cap && q.pending >= 0 && !e->prefilling(i) && qe_pool::pausable_by(cls, q.conv->cls)) vs.push_back(i);
     }
     if (act >= (int)e->sl.size()) return 0;  // every slot is taken: pausing frees no slot
     const int need = std::min(e->np, e->periods_for(n + e->reserve));  // as qe_can_admit / ensure_region
@@ -6317,6 +6318,11 @@ void qe_set_prio(void* p, int slot, int prio) {
     FE* e = (FE*)p;
     Slot& q = e->sl.at(e->batch_api ? slot : e->cs);
     if (q.conv) q.conv->prio = prio;  // (logs and qe_slot_info; no order reads it)
+}
+void qe_set_class(void* p, int slot, int cls) {
+    FE* e = (FE*)p;
+    Slot& q = e->sl.at(e->batch_api ? slot : e->cs);
+    if (q.conv) q.conv->cls = cls == qe_pool::kClassBackground ? qe_pool::kClassBackground : qe_pool::kClassInteractive;
 }
 int qe_num_pinned(void* p) { return (int)((FE*)p)->pins.size(); }
 int qe_last_copied(void* p) { return ((FE*)p)->last_copied; }

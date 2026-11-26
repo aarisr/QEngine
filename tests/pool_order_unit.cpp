@@ -41,6 +41,11 @@ int main() {
     got = qe_pool::longest_accepted({0, 1, 2}, pos, [&](int i) { tried.push_back(i); return false; });
     EXPECT(got == -1 && tried == V({1, 0, 2}));
     EXPECT(qe_pool::longest_accepted({}, pos, [](int) { return true; }) == -1);
+    // QoS classes (bead 2b03): a background start never pauses an interactive decoder; class 0 may pause both
+    EXPECT(qe_pool::pausable_by(qe_pool::kClassBackground, qe_pool::kClassBackground));
+    EXPECT(!qe_pool::pausable_by(qe_pool::kClassBackground, qe_pool::kClassInteractive));
+    EXPECT(qe_pool::pausable_by(qe_pool::kClassInteractive, qe_pool::kClassInteractive));
+    EXPECT(qe_pool::pausable_by(qe_pool::kClassInteractive, qe_pool::kClassBackground));
     printf(fails ? "pool_order_unit: %d FAILED\n" : "pool_order_unit: ok\n", fails);
     return fails ? 1 : 0;
 }

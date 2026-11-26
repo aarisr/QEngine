@@ -962,6 +962,16 @@ class QaSplit:
         return win
 
 
+CLS_BG = {"background"}  # x-request-class header values that schedule as background (class 1)
+
+
+def request_class_of(headers_get):
+    """The request's scheduling class from the x-request-class header: 1 (background) for 'background'
+    (case-insensitive, stripped), 0 (interactive) for a missing or unknown value."""
+    v = headers_get("x-request-class")
+    return 1 if v and v.strip().lower() in CLS_BG else 0
+
+
 class Admission:
     """Which queued request the scheduler starts next (engine thread; called under gen.cv)."""
 
@@ -1078,7 +1088,8 @@ class Admission:
     def pick_next(self, now, prefills):
         """The queued requests that may be prefilled next, best first (empty: keep waiting): the
         least left to compute, aged so that nothing starves (every second of waiting is worth
-        `aging` tokens); every conversation alike (no main-thread rule, user decision 2026-11-12).
+        `aging` tokens); the interactive class before background (aging still anti-starves within a
+        class); every conversation alike (no main-thread rule, user decision 2026-11-12).
         While a long prompt is in progress only a request with at most preempt_max tokens left may
         cut in (this cut-in rule only with --long-share 0; with a share the shared-batch rule below
         applies)."""
@@ -1086,7 +1097,7 @@ class Admission:
         if not q:
             return []
         self.estimate(now)
-        order = sorted(range(len(q)), key=lambda i: q[i].est - (now - q[i].t_enq) * self.aging)
+        order = sorted(range(len(q)), key=lambda i: (q[i].cls, q[i].est - (now - q[i].t_enq) * self.aging))
         if not prefills:
             return order
         join = []
@@ -1250,7 +1261,7 @@ class Admission:
             if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait:
                 if hasattr(e, "protect_ids"):  # [ink-archprot] its archived conversation stays while the copies make room
                     e.protect_ids(j.ids, j)
-                ok = e.pause_for(need, j.prio)  # (any request, by the pool order: the most recently admitted first)
+                ok = e.pause_for(need, j.cls)  # (background callers do not pause interactive decoders)
                 ps2 = e.pause_state()  # (also after a False: pause_slot may have failed after pausing some)
                 if ps2 is not None and ps2[0] > ps[0]:  # (counted and logged only when something was paused)
                     g.sched["pauses"] += 1
@@ -2086,14 +2097,14 @@ class Generator:
         if q:
             print(f"shutdown: {len(q)} queued requests ended", flush=True)
 
-    def run(self, ids, p, on_text, cancelled, affinity=0):
+    def run(self, ids, p, on_text, cancelled, affinity=0, cls=0):
         """Blocking generation; calls on_text(str) for new text. Returns stats dict."""
         if self.stopping:
             raise SequenceFault("server is shutting down")
         if len(ids) + self.args.mtp_k + 2 > max(self.engine.slots):
             raise ValueError(f"prompt has {len(ids)} tokens; the largest context slot holds "
                              f"{max(self.engine.slots)}")
-        job = Job(self, ids, p, on_text, cancelled, affinity)
+        job = Job(self, ids, p, on_text, cancelled, affinity, cls)
         img = getattr(ids, "img", (0, 0))
         self.metrics.queued(job, getattr(ids, "label", "") or "chat", img[0], img[1])
         with self.cv:
@@ -2810,9 +2821,10 @@ class Job:
         (max_tokens, trims, context checks)."""
         return self.n + (1 if self.eos_end and not self.cut else 0)
 
-    def __init__(self, gen, ids, p, on_text, cancelled, affinity):
+    def __init__(self, gen, ids, p, on_text, cancelled, affinity, cls=0):
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
+        self.cls = cls
         self.lp = p.get("logprobs")
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
@@ -2892,6 +2904,8 @@ class Job:
             self.guarded = guard["turns"]
             g.guard_note(dict(guard, seed=len(seed)))
         e.set_prio(self.slot, self.prio)
+        if hasattr(e, "set_class"):  # (the engine's QoS: the scheduler pauses by class, admit pauses only lower)
+            e.set_class(self.slot, self.cls)
         self.grammar = self.p.get("grammar")
         tcs = self.p.get("tool_choice")
         self.tool_banned = False
@@ -3572,7 +3586,7 @@ async def watch_disconnect(req, cancel):
         return
 
 
-def stream_bridge(gen, ids, params, affinity=0, req=None, keepalive=0.0):
+def stream_bridge(gen, ids, params, affinity=0, req=None, keepalive=0.0, cls=0):
     """Run generation in a thread; yields text chunks then the stats dict (async). req: the HTTP request, watched for
     a client disconnect while the generation runs (watch_disconnect). keepalive > 0 (streams only): KEEPALIVE after that
     many seconds without an item."""
@@ -3583,7 +3597,7 @@ def stream_bridge(gen, ids, params, affinity=0, req=None, keepalive=0.0):
     def work():
         try:
             st = gen.run(ids, params, lambda s: loop.call_soon_threadsafe(q.put_nowait, s),
-                         cancel, affinity)
+                         cancel, affinity, cls)
             loop.call_soon_threadsafe(q.put_nowait, st)
         except Exception as ex:  # surface errors to the client
             loop.call_soon_threadsafe(q.put_nowait, ex)
@@ -3641,7 +3655,7 @@ async def fault_events(it):
         yield ex
 
 
-async def complete(gen, ids, params, aff, thinking, tools, tchoice=None, req=None):
+async def complete(gen, ids, params, aff, thinking, tools, tchoice=None, req=None, cls=0):
     """A non-streamed reply: (parser, parts, stats, tool calls), or the SequenceFault of an engine error. A sampled
     reply that ends by itself (finish stop) with no text and no tool call -- reasoning only (EOS inside or right after
     <think>, HF Qwen3.8-Flash-Next #50) or a tool call that does not parse -- is sampled again, up to --empty-retry
@@ -3664,7 +3678,7 @@ async def complete(gen, ids, params, aff, thinking, tools, tchoice=None, req=Non
         parts = {"reasoning": "", "content": "", "logprobs": []}
         st = None
         p = dict(params, empty_retry=(attempt, tries)) if tries else params  # the empty-reply WARNING says retry k/N
-        async for item in fault_events(stream_bridge(gen, ids, p, aff, req)):
+        async for item in fault_events(stream_bridge(gen, ids, p, aff, req, cls=cls)):
             if isinstance(item, SequenceFault):
                 return item
             if isinstance(item, dict):
@@ -4206,6 +4220,7 @@ def build_app(gen: Generator, args):
     # ---------------- OpenAI chat completions ----------------
     @app.post("/v1/chat/completions")
     async def chat(req: Request):
+        cls = request_class_of(req.headers.get)  # x-request-class: background work yields to interactive
         t_in = time.time()  # [ink-srv-gap] QE_REQ_PROF=1: one line of server-side stamps per streamed request
         body = await req.json()
         t_json = time.time()
@@ -4315,7 +4330,7 @@ def build_app(gen: Generator, args):
                 started = False
                 text_seen, t_role = [False], t_in
                 sse_s = [0.0, 0]  # QE_STEP_PROF: event-loop time of parser + chunk JSON, chunks
-                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S)):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S, cls=cls)):
                     if item is KEEPALIVE or (type(item) in (str, LpText) and keepalive_due(last_w)):
                         # (an SSE comment: clients skip it; the role chunk still comes with the first token; also while
                         # the parser holds every item back: a tool call, hidden reasoning)
@@ -4385,7 +4400,7 @@ def build_app(gen: Generator, args):
             last_w = [time.monotonic()]
             return StreamingResponse(stamped(sse(), last_w), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req, cls=cls)
         if isinstance(r, Cancelled):  # [srv-disconnect] the client left (nobody reads it; the access log says 499)
             return JSONResponse({"error": {"message": str(r), "type": "client_closed_request"}}, status_code=499)
         if isinstance(r, SequenceFault):
@@ -4432,6 +4447,7 @@ def build_app(gen: Generator, args):
 
     @app.post("/v1/messages")
     async def messages(req: Request):
+        cls = request_class_of(req.headers.get)  # x-request-class: background work yields to interactive
         body = await req.json()
         bad = request_shape_error(body, anthropic=True)
         if bad:
@@ -4533,7 +4549,7 @@ def build_app(gen: Generator, args):
                                                           "delta": delta}))
                     return out
 
-                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S)):
+                async for item in fault_events(stream_bridge(gen, ids, params, aff, req, SSE_KEEPALIVE_S, cls=cls)):
                     if item is KEEPALIVE or (type(item) in (str, LpText) and keepalive_due(last_w)):
                         if keepalive_due(last_w):  # (Anthropic's own keep-alive event; also while text is held back)
                             yield ev("ping", {"type": "ping"})
@@ -4581,7 +4597,7 @@ def build_app(gen: Generator, args):
             last_w = [time.monotonic()]
             return StreamingResponse(stamped(sse(), last_w), media_type="text/event-stream")
 
-        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req)
+        r = await complete(gen, ids, params, aff, reply_thinking(gen, ids, kw), tools, tchoice, req, cls=cls)
         if isinstance(r, Cancelled):  # [srv-disconnect] the client left
             return JSONResponse({"type": "error", "error": {"type": "client_closed_request", "message": str(r)}},
                                 status_code=499)
