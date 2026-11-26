@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 COUNTERS = ("requests", "errors", "prompt_tokens", "cached_tokens", "prefill_tokens", "prefill_s",
             "gen_tokens", "decode_s", "steps", "seq_steps", "images", "image_tokens", "energy_j",
-            "uptime_s")
+            "uptime_s", "spec_steps", "spec_drafted", "spec_accepted", "think_tokens")
 
 
 class Metrics:
@@ -51,6 +51,7 @@ class Metrics:
         self.last_done = collections.deque(maxlen=12)
         self.ended = collections.deque()  # (t, frozen job view) of requests finished in the last 10 s
         self.engine = {}
+        self.adapt = None  # engine_stats.AdaptStats: the engine's adaptive verification counters (/metrics)
         self.gpus = []
         self.step_ms = collections.deque(maxlen=200)
         self._energy = {}
@@ -145,6 +146,23 @@ class Metrics:
                                        "prefill_tps": j.get("prefill_tps", 0), "t": time.time(),
                                        "error": str(error) if error else "",
                                        **({"session": sess} if sess else {})})
+
+    def drafts(self, ds):
+        """A finished request's draft counters (engine_stats.delta: [steps, MTP drafted, accepted, lookup drafted,
+        accepted]): the SpecDecoding line's numbers, summed for /metrics."""
+        if not ds or ds[0] <= 0:
+            return
+        with self.lock:
+            s = self.session
+            s["spec_steps"] += ds[0]
+            s["spec_drafted"] += ds[1] + ds[3]
+            s["spec_accepted"] += ds[2] + ds[4]
+
+    def thinking(self, tokens):
+        """A finished request's reasoning tokens (the think-budget controller's count) for /metrics."""
+        if tokens:
+            with self.lock:
+                self.session["think_tokens"] += int(tokens)
 
     def reset_session(self):
         """Dashboard "reset": the session's counters move into the global totals (nothing is lost
@@ -308,6 +326,27 @@ class Metrics:
         m("cached_tokens_total", se["cached_tokens"], "prompt tokens served from the cache", "counter")
         m("prefill_tokens_total", se["prefill_tokens"], "prompt tokens computed", "counter")
         m("requests_total", se["requests"], "requests since start", "counter")
+        m("thinking_tokens_total", se["think_tokens"], "reasoning tokens generated (requests under the think-budget controller)", "counter")
+        m("spec_verify_steps_total", se["spec_steps"], "speculative verify steps (accepted + steps = tokens emitted)", "counter")
+        m("spec_drafted_tokens_total", se["spec_drafted"], "draft tokens verified (MTP and lookup)", "counter")
+        m("spec_accepted_tokens_total", se["spec_accepted"], "draft tokens the model accepted (MTP and lookup)", "counter")
+        out.append("# HELP qengine_prompt_cache_requests_total requests by where their cached prompt prefix came from\n"
+                   "# TYPE qengine_prompt_cache_requests_total counter")
+        cs = se["cache_src"]
+        for name in ("live", "archive", "other slot", "none"):
+            out.append(f'qengine_prompt_cache_requests_total{{source="{name.replace(" ", "_")}"}} {cs.get(name, 0)}')
+        ad = self.adapt.read() if self.adapt is not None else None
+        if ad:
+            for name, val, help_ in (
+                    ("dfa_verifications_total", ad[0], "adaptive DFlash2 block verifications"),
+                    ("dfa_drafts_verified_total", ad[1], "block drafts those verifications verified"),
+                    ("dfa_drafts_accepted_total", ad[2], "block drafts the model accepted"),
+                    ("mba_verifications_total", ad[3], "shared batched MTP verifications (sequence-steps)"),
+                    ("mba_drafts_verified_total", ad[4], "MTP drafts they verified"),
+                    ("mba_drafts_accepted_total", ad[5], "MTP drafts the model accepted"),
+                    ("mba_even_split_drafts_total", ad[6], "MTP drafts an even split would have verified"),
+                    ("mba_plans_total", ad[7], "batched MTP share plans made")):
+                m(name, val, help_ + " (engine lifetime)", "counter")
         m("energy_joules_total", round(se["energy_j"], 1), "GPU energy since start", "counter")
         m("decode_tokens_per_second", round(s["rate"]["tok_s_10"], 2), "decode rate (10 s)")
         m("active_sequences", sum(1 for j in s["jobs"] if j["state"] != "queued"), "sequences running")

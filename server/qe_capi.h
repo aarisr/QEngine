@@ -171,6 +171,10 @@ int qe_capture(void* e, const int* ids, int n, int r0, float* out);
 // draft statistics of a slot since its creation: out[5] = {verify steps, MTP drafted, MTP accepted, lookup drafted,
 // lookup accepted}; the server prints their difference over a request (server/engine_stats.py, QE_STATS_LOG)
 void qe_draft_stats(void* e, int slot, long long* out);
+// engine-wide adaptive verification counters since the engine started: out[8] = {block verifications, block drafts
+// verified, block drafts accepted, shared MTP verifications, MTP drafts verified, MTP drafts accepted, MTP drafts an even
+// split would have verified, plans}; the server's /metrics exports them (27B only; absent in other engine libraries)
+void qe_adapt_stats(void* e, long long* out);
 
 #ifdef __cplusplus
 }

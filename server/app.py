@@ -1454,6 +1454,7 @@ class Generator:
         from metrics import Metrics
         stats = os.path.expanduser(args.stats_file)
         self.metrics = Metrics(stats, args.served_name)
+        self.metrics.adapt = engine_stats.AdaptStats(self.engine)  # qe_adapt_stats: the 0026/0027 adaptation counters in /metrics
         # main agent thread detection (server/agents.py) and the scheduler's counters, both in /api/stats
         self.agents = Tracker(override=getattr(args, "main_agent_re", None))
         self.sched = {"pauses": 0, "backfills": 0}
@@ -3448,6 +3449,7 @@ class Job:
                 self.stats["logprobs"] = self.lp_out  # (entries no text carried: the HTTP side's last chunk)
             if ds is not None:
                 self.stats["drafts"] = ds  # [steps, MTP drafted, accepted, lookup drafted, accepted]
+                self.gen.metrics.drafts(ds)  # /metrics qengine_spec_*
             if trimmed is not None:
                 self.stats["stop_trim"] = trimmed
             if getattr(self, "client_gone", False):
@@ -3461,6 +3463,7 @@ class Job:
             tc = getattr(self, "tc", None)
             if tc is not None:
                 self.stats["think"] = tc.stats()
+                self.gen.metrics.thinking(tc.n)  # /metrics qengine_thinking_tokens_total
                 g = self.gen
                 g.think_add("requests_with_budget", tc.budget is not None)
                 g.think_src(tc.src)

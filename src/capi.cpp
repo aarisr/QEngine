@@ -300,6 +300,14 @@ void qe_archive_info(void* e, double* out) { ((Engine*)e)->archive_info(out); }
 void qe_pool_counters(void* e, long long* out) { ((Engine*)e)->pool_counters(out); }
 int qe_spec_step(void* e, int* out) { QE_STEP_CALL; return ((Engine*)e)->spec_step(out); }
 void qe_draft_stats(void* e, int slot, long long* out) { ((Engine*)e)->draft_stats(slot, out); }
+// engine-wide adaptive verification counters (QE_DF_ADAPT, QE_MTP_BATCH_ADAPT), since the engine started: {block verifications,
+// block drafts verified, accepted, shared MTP verifications, MTP drafts verified, accepted, drafts an even split would have
+// verified, plans}; the server's /metrics exports them (qengine_dfa_*, qengine_mba_*)
+void qe_adapt_stats(void* e, long long* out) {
+    const Engine* g = (Engine*)e;
+    const long long v[8] = {g->dfa_steps_, g->dfa_rows_, g->dfa_acc_, g->mba_steps_, g->mba_rows_, g->mba_acc_, g->mba_even_, g->mba_plans_};
+    for (int i = 0; i < 8; i++) out[i] = v[i];
+}
 // DFlash2 block drafter: {block steps, their tokens}; ms per drafter block (development check, -1: no drafter)
 void qe_dfl_stats(void* e, long long* out) { out[0] = ((Engine*)e)->df_steps_, out[1] = ((Engine*)e)->df_tok_; }
 double qe_dfl_bench(void* e, int iters) { return ((Engine*)e)->dfl_bench(iters); }

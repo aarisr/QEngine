@@ -48,6 +48,33 @@ class DraftStats:
         return list(self.buf)
 
 
+class AdaptStats:
+    """Reads the engine's adaptive verification counters (qe_adapt_stats; None when the library does not have them)."""
+
+    def __init__(self, engine):
+        self.fn = None
+        self.h = getattr(engine, "h", None)
+        try:
+            f = engine.lib.qe_adapt_stats
+        except AttributeError:
+            return
+        f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_longlong)]
+        f.restype = None
+        self.fn = f
+        self.buf = (ctypes.c_longlong * 8)()
+
+    def read(self):
+        """[block verifications, block drafts verified, accepted, shared MTP verifications, MTP drafts verified,
+        accepted, even-split drafts, plans] since the engine started, or None."""
+        if self.fn is None:
+            return None
+        try:
+            self.fn(self.h, self.buf)
+        except Exception:
+            return None
+        return list(self.buf)
+
+
 def delta(a, b):
     """Counters over a request: b - a (a slot reset in between: b alone)."""
     if b is None:
