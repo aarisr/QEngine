@@ -203,6 +203,22 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
         gemm_tune_set_model(fp.str());
     }
     if (env_set("QE_MTP_ADAPT")) adapt_ = env_int("QE_MTP_ADAPT", adapt_);
+    // [q27-mba] QE_MTP_BATCH_ADAPT: the sequences of a batched step share its rows for their MTP drafts by each one's
+    // acceptance (src/mtp_share.h); 0: the same count for every sequence, as before. Default on with more than one card
+    // (as QE_DF_ADAPT); needs the adaptive draft count (QE_MTP_ADAPT=1, the default).
+    static_assert(qe_mba::kDepth == kMaxSpecK && qe_mba::kMaxSeq == kMaxSegs, "mtp_share.h sizes");
+    mba_on_ = env_int("QE_MTP_BATCH_ADAPT", devices.size() > 1 ? 1 : 0) != 0;
+    mba_extra_ = std::max(0, std::min(kMaxSpecK, env_int("QE_MTP_BATCH_EXTRA", mba_extra_)));
+    mba_period_ = std::max(1, env_int("QE_MTP_BATCH_PERIOD", mba_period_));
+    mba_explore_ = env_int("QE_MTP_BATCH_EXPLORE", 1) != 0;
+    mba_min_ = std::max(0, std::min(kMaxSpecK, env_int("QE_MTP_BATCH_MIN", mba_min_)));
+    mba_floor_ = std::max(0.0, (double)env_double("QE_MTP_BATCH_FLOOR", mba_floor_));
+    mba_pass_ = std::max(0.0, (double)env_double("QE_MTP_BATCH_PASS", mba_pass_));
+    mba_hyst_ = std::max(0.0, (double)env_double("QE_MTP_BATCH_HYST", mba_hyst_));
+    if (mba_on_ && adapt_ == 1)
+        printf("MTP drafts in batched steps: the step's rows are shared by each conversation's acceptance, up to %d drafts "
+               "over the even split (QE_MTP_BATCH_ADAPT=1; planned every %d launches; QE_MTP_BATCH_ADAPT=0: the same count "
+               "for every conversation)\n", mba_extra_, mba_period_);
     if (const char* e = env_str("QE_SPEC_COST")) sscanf(e, "%lf,%lf", &cost0_, &cost1_);
     // checkpoint spacing of a prompt's prefill (state saved every QE_CKPT tokens, multiple of 256)
     if (env_set("QE_CKPT")) ckpt_every_ = std::max(256, env_int("QE_CKPT", ckpt_every_) / 256 * 256);
@@ -3868,6 +3884,72 @@ void Engine::dfa_log() {
             dfa_rows_ ? 100.0 * dfa_acc_ / dfa_rows_ : 0.0, dfa_row_.get(cost1_), dfa_row_.w < 3 ? " (default)" : "", kDflDrafts, h);
 }
 
+// [q27-mba] the MTP drafts each sequence of the batched launch verifies (src/mtp_share.h): mk[i] for bslots_[i], -1 for
+// a sequence that keeps the even split (grammar-constrained, block drafts). The step's drafts are the even split's
+// (min(next_k(), cap) each) plus the rows that split leaves over when the cap is what limits it. Planned again when the
+// sequences, their available drafts or the budget change and every QE_MTP_BATCH_PERIOD launches; one sequence in turn
+// verifies one draft more for a period (QE_MTP_BATCH_EXPLORE). Returns the MTP drafts the launch should make per sequence
+// (-1: as before).
+int Engine::mba_plan(int n, int* mk) {
+    std::fill(mk, mk + n, -1);
+    if (!mba_on_ || adapt_ != 1 || bcap_ < 1 || n < 2 || n > qe_mba::kMaxSeq) return -1;
+    const int kb = std::min(next_k(), bcap_), kmax = std::min(std::min(k_, kMaxSpecK), bcap_ + mba_extra_);
+    int idx[kMaxSegs], lim[kMaxSegs], prev[kMaxSegs], m = 0;
+    const qe_dfa::Rates* rs[kMaxSegs];
+    unsigned long long sig = 1469598103934665603ull;
+    const auto mix = [&](unsigned long long v) { sig = (sig ^ v) * 1099511628211ull; };
+    for (int i = 0; i < n; i++) {
+        const Seq& q = seqs_[bslots_[i]];
+        if (q.constrained || q.k_blk || q.k_dfl) continue;
+        idx[m] = i;
+        lim[m] = std::min(q.k_avail, kmax);
+        prev[m] = q.mba.k;
+        rs[m] = &q.mba.r;
+        mix((unsigned long long)bslots_[i] * 8 + lim[m]);
+        m++;
+    }
+    if (m < 2) return -1;
+    const int drafts = m * kb + (m == n && kb == bcap_ ? bspare_ : 0);
+    mba_tick_++;
+    mba_kb_ = kb;
+    const unsigned long long epoch = mba_tick_ / mba_period_;
+    mix(drafts), mix(kmax), mix(epoch);
+    if (sig != mba_sig_) {
+        qe_mba::Gain g;
+        int k[kMaxSegs];
+        qe_mba::gains(rs, mba_all_, m, g);
+        qe_mba::share(g, m, lim, prev, drafts, mba_floor_, mba_hyst_, mba_explore_ ? (int)(epoch % m) : -1, k, mba_min_);
+        mba_kd_ = qe_mba::depth(g, m, prev, drafts, mba_floor_, mba_hyst_, kmax, mba_pass_, mba_kd_, mba_min_);
+        for (int j = 0; j < m; j++) seqs_[bslots_[idx[j]]].mba.k = k[j];
+        mba_sig_ = sig;
+        mba_plans_++;
+    }
+    for (int j = 0; j < m; j++) mk[idx[j]] = std::min(seqs_[bslots_[idx[j]]].mba.k, lim[j]);
+    return std::max(1, mba_kd_);
+}
+
+void Engine::mba_observe(Seq& q, int kv, int accepted, int even) {
+    q.mba.r.observe(kv, accepted, 0.97);
+    mba_all_.observe(kv, accepted, 0.97);
+    mba_steps_++, mba_rows_ += kv, mba_acc_ += std::max(0, std::min(accepted, kv)), mba_even_ += even;
+    static const int every = env_int("QE_MTP_BATCH_LOG", 0);  // a line every that many shared verifications (0: none)
+    if (every > 0 && mba_steps_ % every == 0) mba_log();
+}
+
+void Engine::mba_log() {
+    int hist[kMaxSpecK + 1] = {};
+    for (int s : bslots_) {
+        const Seq& q = seqs_[s];
+        if (q.active && !q.constrained && !q.k_dfl && q.mba.k >= 0) hist[std::min(q.mba.k, kMaxSpecK)]++;
+    }
+    char h[96] = "";
+    for (int k = 0, o = 0; k <= kMaxSpecK; k++) o += snprintf(h + o, sizeof h - o, "%s%d", k > 0 ? "/" : "", hist[k]);
+    fprintf(stderr, "[mba] %lld batched MTP verifications | drafts verified %.2f (even split %.2f), accepted %.2f per sequence-step "
+            "(%.0f %%) | %d drafts made per sequence | %lld plans | sequences by share 0..%d: %s\n", mba_steps_,
+            (double)mba_rows_ / mba_steps_, (double)mba_even_ / mba_steps_, (double)mba_acc_ / mba_steps_,
+            mba_rows_ ? 100.0 * mba_acc_ / mba_rows_ : 0.0, mba_kd_, mba_plans_, kMaxSpecK, h);
+}
+
 int Engine::start(const int* ids, int n, int k, unsigned long long affinity, int hint) {
     return start_mm(ids, n, k, affinity, hint, nullptr, 0, nullptr, 0);
 }
@@ -4731,6 +4813,9 @@ void Engine::launch_batch(int buf, bool ahead) {
     const int n = bslots_.size();
     dfa_btick_++;
     int kvs[kMaxBatch];
+    // [q27-mba] MTP drafts: the step's rows shared by each sequence's acceptance (QE_MTP_BATCH_ADAPT), not evenly
+    int mk[kMaxBatch];
+    const int mkd = mba_plan(n, mk);
     // grammar-constrained sequences: (index, masks, spec_io) - the caller's drafts and masks
     std::vector<std::tuple<int, const unsigned*, int*>> con;
     for (int i = 0; i < n; i++) {
@@ -4748,9 +4833,12 @@ void Engine::launch_batch(int buf, bool ahead) {
         // [q27-dfa] block drafts: as many as pay for this slot in a step of n sequences (never more than the step's cap)
         bool dprobe = false;
         const bool dfa = dfa_on_ && !q.constrained && q.k_dfl && q.k_avail == kDflDrafts;
-        const int kva = dfa ? std::min(kv0, dfa_kv(bslots_[i], n, i, &dprobe)) : kv0;
+        int kva = dfa ? std::min(kv0, dfa_kv(bslots_[i], n, i, &dprobe)) : mk[i] >= 0 ? mk[i] : kv0;
+        // [q27-mba] more drafts than the cap step_batch made room for: only with the room a lookup step keeps behind it
+        if (mk[i] > kv0) kva = std::max(kv0, std::min(kva, q.max_t - base - (kMaxSpecK + 1) - 2));
         kvs[i] = bkvs_[buf][i] = std::min(clamp_kv(q, kva, base), std::max(0, q.max_t - base - 1));
-        bclamp_[buf][i] = kvs[i] < kv0;
+        bclamp_[buf][i] = kvs[i] < (mk[i] >= 0 ? kva : kv0);
+        bmba_[buf][i] = mk[i] >= 0 && kvs[i] == kva ? 1 + mba_kb_ : 0;
         bdfa_[buf][i] = dfa && kvs[i] == kva ? (dprobe ? 2 : 1) : 0;
         if (q.constrained) con.emplace_back(i, mask_buffer(bslots_[i]), spec_io(bslots_[i]));
     }
@@ -4915,7 +5003,10 @@ void Engine::launch_batch(int buf, bool ahead) {
     }
     // MTP drafts (when every sequence drafts with the block: only the MTP pass that keeps their MTP caches current)
     const bool all_blk = any_blk && std::count(dring.begin(), dring.end(), -1) == 0;
-    const int kd = all_blk ? std::min(1, bcap_) : std::min(next_k(), bcap_);
+    int kd = all_blk ? std::min(1, bcap_) : std::min(next_k(), bcap_);
+    // [q27-mba] as many MTP drafts as the deepest share of the next step needs (never fewer than a grammar-constrained
+    // sequence gets today)
+    if (!all_blk && mkd > 0) kd = con.empty() ? mkd : std::max(kd, mkd);
     bkd_[buf] = kd;
     if (dfl_on_ && df_batch_ > 0)  // (review M1 / L1) a ring of a sequence that drafts with MTP here falls behind from its base
         for (int i = 0; i < n; i++)
@@ -5027,7 +5118,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
             if (live != bslots_) {
                 bslots_ = live;
                 bdrop_.clear();
-                bcap_ = cap;
+                bcap_ = cap, bspare_ = std::max(0, brows - n * (cap + 1));
                 for (int i = 0; i < n; i++)
                     if (from[i] < 0 && !seqs_[sl[i]].full && !seqs_[sl[i]].paused) {
                         Seq& q = seqs_[sl[i]];
@@ -5107,7 +5198,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         if (run.empty()) return;
         bslots_ = run;
         bdrop_.clear();
-        bcap_ = cap;
+        bcap_ = cap, bspare_ = std::max(0, brows - n * (cap + 1));
         launch_batch(bbuf_, false);
         binflight_ = true;
     } else {
@@ -5162,6 +5253,8 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
         if (!q.constrained && !bclamp_[bbuf_][from[i]] && !lkstep && !bstep) observe(bkvs_[bbuf_][from[i]], c - 1);
         if (bstep) df_steps_++, df_tok_ += c;
         if (bdfa_[bbuf_][from[i]] && !lkstep) dfa_observe(q, bkvs_[bbuf_][from[i]], c - 1);  // [q27-dfa]
+        if (bmba_[bbuf_][from[i]] && !lkstep && !bstep)  // [q27-mba]
+            mba_observe(q, bkvs_[bbuf_][from[i]], c - 1, bmba_[bbuf_][from[i]] - 1);
         if (lkb_on_) {
             const int s = sl[i];
             if (lkb_len_[s] >= 0) lkb_len_[s] += c;

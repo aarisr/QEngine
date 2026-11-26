@@ -1,6 +1,7 @@
 #pragma once
 #include "archive_order.h"
 #include "df_adapt.h"
+#include "mtp_share.h"
 #include "gpu_others.h"
 #include <mutex>
 #include "host_mem.h"
@@ -369,6 +370,7 @@ private:
         bool k_blk = false;         // [q27-bdfl] those drafts came from the DFlash2 block drafter
         bool k_dfl = false;         // [q27-dfa] those drafts are block drafts (single-sequence or batched launch)
         qe_dfa::Slot dfa;           // [q27-dfa] the slot's block-draft acceptance, step time and verify count
+        qe_mba::Slot mba;           // [q27-mba] the slot's MTP acceptance in batched steps and its share of the step's rows
         bool active = false;        // in use by a generating request
         bool stale = false;         // device token/position invalid (queued step undone)
         int prio = 1;               // scheduling value (set_prio): logs and slot_info only, no order reads it
@@ -470,6 +472,25 @@ private:
     void dfa_log();
   public:
     long long dfa_steps_ = 0, dfa_rows_ = 0, dfa_acc_ = 0;  // adaptive block verifications: steps, drafts verified / accepted
+  private:
+    // [q27-mba] QE_MTP_BATCH_ADAPT: the sequences of a batched step share its rows for their MTP drafts by each one's
+    // acceptance (src/mtp_share.h), not evenly
+    bool mba_on_ = false;
+    int mba_extra_ = 2, mba_period_ = 32;                       // QE_MTP_BATCH_EXTRA, QE_MTP_BATCH_PERIOD
+    bool mba_explore_ = true;                                   // QE_MTP_BATCH_EXPLORE
+    int mba_min_ = 1;                                           // QE_MTP_BATCH_MIN
+    double mba_floor_ = 0.10, mba_pass_ = 0.02, mba_hyst_ = 0.10;  // QE_MTP_BATCH_FLOOR, _PASS, _HYST
+    qe_dfa::Rates mba_all_;              // every slot's MTP acceptance in batched steps (the prior of a slot)
+    unsigned long long mba_tick_ = 0, mba_sig_ = 0;  // batched launches that shared; what the last plan was made for
+    int mba_kd_ = 0, mba_kb_ = 0;        // the MTP drafts per sequence the last plan asked for; the even split's count
+    int bspare_ = 0;                     // rows of the step's budget the even split leaves over (with bcap_)
+    char bmba_[2][kMaxSegs] = {};        // per sequence of the batched step in each buffer: 1 + the even split's drafts (0: not shared)
+    int mba_plan(int n, int* mk);        // shares of the launch's sequences (mk[i], -1: as before); returns the drafts to make
+    void mba_observe(Seq& q, int kv, int accepted, int even);
+    void mba_log();
+  public:
+    // shared MTP verifications: sequence-steps, drafts verified / accepted, the drafts an even split would have verified, plans
+    long long mba_steps_ = 0, mba_rows_ = 0, mba_acc_ = 0, mba_even_ = 0, mba_plans_ = 0;
   private:
     std::vector<int> lkb_len_, lkb_miss_;
     std::vector<char> lkb_dirty_, lkb_mode_;
