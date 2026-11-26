@@ -972,6 +972,17 @@ def request_class_of(headers_get):
     return 1 if v and v.strip().lower() in CLS_BG else 0
 
 
+SESSION_HASH = re.compile(r"^[0-9a-f]{1,32}$")
+
+
+def session_hash_of(headers_get):
+    """The gpu-scheduler's x-session-hash header (the sha256 prefix of the client's session key, 12 hex):
+    the hash when the value is 1-32 lowercase hex characters, else None (the request's log line and
+    /api/stats recent[] entry then carry no session, as before the header existed)."""
+    v = headers_get("x-session-hash")
+    return v if v and SESSION_HASH.match(v) else None
+
+
 class Admission:
     """Which queued request the scheduler starts next (engine thread; called under gen.cv)."""
 
@@ -2097,14 +2108,16 @@ class Generator:
         if q:
             print(f"shutdown: {len(q)} queued requests ended", flush=True)
 
-    def run(self, ids, p, on_text, cancelled, affinity=0, cls=0):
-        """Blocking generation; calls on_text(str) for new text. Returns stats dict."""
+    def run(self, ids, p, on_text, cancelled, affinity=0, cls=0, req=None):
+        """Blocking generation; calls on_text(str) for new text. Returns stats dict. req: the HTTP request
+        (x-session-hash header for the per-request record); the stream and non-stream paths both pass it."""
         if self.stopping:
             raise SequenceFault("server is shutting down")
         if len(ids) + self.args.mtp_k + 2 > max(self.engine.slots):
             raise ValueError(f"prompt has {len(ids)} tokens; the largest context slot holds "
                              f"{max(self.engine.slots)}")
         job = Job(self, ids, p, on_text, cancelled, affinity, cls)
+        job.session = session_hash_of(req.headers.get) if req is not None else None
         img = getattr(ids, "img", (0, 0))
         self.metrics.queued(job, getattr(ids, "label", "") or "chat", img[0], img[1])
         with self.cv:
@@ -2825,6 +2838,7 @@ class Job:
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
         self.cls = cls
+        self.session = None  # the request's x-session-hash header (session_hash_of): the [chat] line and /api/stats recent[]
         self.lp = p.get("logprobs")
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
         self.glk = None  # TokenLookup of a constrained reply (grammar.py)
@@ -3428,7 +3442,8 @@ class Job:
                           "cache_src": self.src,
                           "completion_tokens": self.n_out(), "finish": self.finish, "slot": self.slot,
                           "prefill_s": self.t1 - self.t0, "decode_s": t2 - self.t1,
-                          "queue_s": max(0.0, self.t0 - self.t_enq)}
+                          "queue_s": max(0.0, self.t0 - self.t_enq),
+                          **({"session": self.session} if self.session else {})}
             if self.lp is not None:
                 self.stats["logprobs"] = self.lp_out  # (entries no text carried: the HTTP side's last chunk)
             if ds is not None:
@@ -3597,7 +3612,7 @@ def stream_bridge(gen, ids, params, affinity=0, req=None, keepalive=0.0, cls=0):
     def work():
         try:
             st = gen.run(ids, params, lambda s: loop.call_soon_threadsafe(q.put_nowait, s),
-                         cancel, affinity, cls)
+                         cancel, affinity, cls, req)
             loop.call_soon_threadsafe(q.put_nowait, st)
         except Exception as ex:  # surface errors to the client
             loop.call_soon_threadsafe(q.put_nowait, ex)
@@ -3765,7 +3780,8 @@ def log_stats(kind, st):
     print(f"[{kind}] slot {st['slot']} prompt {st['prompt_tokens']} (cached {st['cached_tokens']}{src}, prefill "
           f"{pps:.0f} tok/s) | gen {st['completion_tokens']} @ {tps:.1f} tok/s | {st['finish']}{gr}"
           f"{' | stop trim ' + ('ok' if st['stop_trim'] else 'missed') if 'stop_trim' in st else ''}{think_note(st)}"
-          f"{' | tool_choice ' + st['tool_choice'] if st.get('tool_choice') else ''}",
+          f"{' | tool_choice ' + st['tool_choice'] if st.get('tool_choice') else ''}"
+          f"{' | session ' + st['session'] if st.get('session') else ''}",
           flush=True)
     engine_stats.log(st, st.get("drafts"))  # [stats] lines for benchmark log parsers (QE_STATS_LOG=0: off)
 

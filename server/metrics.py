@@ -138,11 +138,13 @@ class Metrics:
             if error is not None:
                 self.session["errors"] += 1
             if j and j["state"] == "decode":
+                sess = getattr(job, "session", None)
                 d = time.time() - j["t_d"]
                 self.last_done.append({"label": j["label"], "prompt": j["prompt"], "cached": j["cached"],
                                        "gen": j["gen"], "tps": j["gen"] / max(d, 1e-6),
                                        "prefill_tps": j.get("prefill_tps", 0), "t": time.time(),
-                                       "error": str(error) if error else ""})
+                                       "error": str(error) if error else "",
+                                       **({"session": sess} if sess else {})})
 
     def reset_session(self):
         """Dashboard "reset": the session's counters move into the global totals (nothing is lost
