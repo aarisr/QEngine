@@ -263,12 +263,12 @@ __global__ void __launch_bounds__(128) k_dn_rec_bq(const float* __restrict__ cv,
 // k_idx_prep per segment (one block per segment, its rows in order): the slot's raw-key ring and pooled keys
 __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* __restrict__ qn, const bf16* __restrict__ kn,
                              const int* __restrict__ rpos, const int* __restrict__ rbase, const int* __restrict__ rslot,
-                             float* __restrict__ iq, float* const* __restrict__ ttail, bf16* __restrict__ ikb0, Plan p, int rps) {
+                             float* __restrict__ iq, float* const* __restrict__ ttail, bf16* __restrict__ ikb0, Plan p, int rps, KvMap hm = {}) {
     __shared__ float red[32];
     __shared__ float xs[IDX_HD];
     const int d = threadIdx.x, r0 = blockIdx.x * rps;
     float* tail = ttail[rslot[r0]];
-    bf16* ikb = ikb0 + (size_t)(rbase[r0] / IDX_R) * IDX_HD;
+    const size_t rb0 =  (size_t)rbase[r0] ;
     int sl = -1;  // the slot of the rows being roped (multimodal positions)
     auto norm_rope = [&](float x, const bf16* w, int pos) {
         const float ss = block_sum<128>(x * x, red);
@@ -299,8 +299,14 @@ __global__ void k_idx_prep_b(const float* __restrict__ ip, int ld, const bf16* _
             const float pooled = __bfloat162float(__float2bfloat16(sm * 0.25f));
             const float kr = norm_rope(pooled, kn, pos - 3);
             const int row = own_row(p, pos - 3);
-            if (row >= 0) ikb[(size_t)(row >> 2) * IDX_HD + d] = __float2bfloat16(kr);
-        }
+            if (row >= 0) {
+        kv_assert_writable(hm, rb0 + (size_t)row);
+        const size_t block =
+            kv_phys_block(hm, rb0 / IDX_R +(size_t)(row >> 2) );
+        ikb0[block * IDX_HD + d] = __float2bfloat16(kr);
+        
+      }
+    }
         __syncthreads();
     }
 }
@@ -485,7 +491,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, posd_, qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, p_, nqp,
                                                    qh0, rp, rb, rs, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_prep");
     k_idx_prep_b<<<m / rps, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, rp, rb, rs, gates_, tab(TB_IT, li),
-                                              kb.ikb, p_, rps);
+                                              kb.ikb, p_, rps, kvmap(L));
     KCHK("qsa_b prep");
     const int lbmax = srows_ / IDX_R;
     Xchg xq;
@@ -498,7 +504,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     for (int g = 0; g < p_.ngpu; g++) { xi.recv[g] = xipr_[g]; xi.flags[g] = xipf_[g]; }
     xi.seq = xiseq_;
     xi.done = xidone_;
-    k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb); CUDA_TRACE_LAUNCH("k_idx_score");
+    k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_score");
     const int ilt = idx_local_threads(m);  // (1024 for <= 32 rows, as measured; 512 above)
     if (idx_gk_) { k_idx_local<true><<<m, ilt, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp); CUDA_TRACE_LAUNCH("k_idx_local"); }
     else { k_idx_local<<<m, ilt, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp); CUDA_TRACE_LAUNCH("k_idx_local"); }

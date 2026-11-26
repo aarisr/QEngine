@@ -1285,14 +1285,52 @@ __device__ __forceinline__ int own_row(const Plan& p, int pos) {  // -1: not own
 // no streaming (device rows = logical rows, as before).
 // K / V row pointers and scales of the sequence row r (region start rb) for kv head kvh. K4 (4-bit rows, kv4_mode):
 // 128 bytes of nibbles per (row, kv head), the scale pointer at its 8 fp16 group scales (4 floats)
+
+// ---- KV streaming (FLASH_KV_STREAM): the K / V rows + scales of every logical row live in mapped pinned host memory
+// (hk / hv / hks / hvs, [logical rows][2][256] as the device arrays), VRAM keeps a block cache per layer: physical
+// block i = device rows [4 i, 4 i + 4) of kc / vc / ks / vs. pt[logical block] = physical block or -1 (not cached:
+// readers fall back to the host row). Logical row g = region start row + owned row of the sequence. pt == nullptr:
+// no streaming (device rows = logical rows, as before).
+// K / V row pointers and scales of the sequence row r (region start rb) for kv head kvh. K4 (4-bit rows, kv4_mode):
+// 128 bytes of nibbles per (row, kv head), the scale pointer at its 8 fp16 group scales (4 floats)
+
+// Translate a virtual owned-row address. map_own is period-aligned and must
+// also be divisible by IDX_R so complete pooled blocks stay within a period.
+__device__ __forceinline__ size_t kv_phys_row(const KvMap &km, size_t row) {
+  if (!km.period_map)
+    return row;
+  if (km.map_own <= 0)
+    __trap();
+  const int physical = km.period_map[row / (size_t)km.map_own];
+  if (physical < 0)
+    __trap();
+  return (size_t)physical * km.map_own + row % (size_t)km.map_own;
+}
+__device__ __forceinline__ void kv_assert_writable(const KvMap &km,
+                                                   size_t logical_row) {
+  if (!km.prefix_periods)
+    return;
+  if (km.map_own <= 0 || km.slot_periods <= 0)
+    __trap();
+  const size_t lp = logical_row / (size_t)km.map_own;
+  const size_t slot = lp / (size_t)km.slot_periods;
+  if (lp % (size_t)km.slot_periods < (size_t)km.prefix_periods[slot])
+    __trap();
+}
+__device__ __forceinline__ size_t kv_phys_block(const KvMap &km, size_t block) {
+  return kv_phys_row(km, block * IDX_R) / IDX_R;
+}
+// KV streaming: block-cache tags and host rows are physical; a miss falls back
+// to the physical pool row. With no map, the historical identity is unchanged.
 template <bool K4 = false>
 __device__ __forceinline__ void kv_rowp(const KvMap& km, const uint8_t* kc, const uint8_t* vc, const float* ks,
                                         const float* vs, size_t rb, int r, int kvh, const uint8_t*& kp,
                                         const uint8_t*& vp, const float*& ksp, const float*& vsp) {
     constexpr size_t HB = K4 ? HD / 2 : HD, SF = K4 ? 4 : 1;
-    size_t row = (size_t)r;
+    size_t row =   km.period_map ? kv_phys_row(km, rb + (size_t)r) : (size_t)r;
     if (km.pt) {
-        const size_t g = rb + (size_t)r;
+        const size_t g =  
+        km.period_map ? kv_phys_row(km, rb + (size_t)r) : rb + (size_t)r;
         const int b = km.pt[g >> 2];
         if (b >= 0) row = (size_t)b * 4 + (g & 3);
         else { kc = km.hk; vc = km.hv; ks = km.hks; vs = km.hvs; row = g; }
@@ -1431,7 +1469,7 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
     // batched rows (rpos / rbase, flash_batch.cuh): the row's own position and KV region (first row of its slot)
     const int pos = rpos ? rpos[t] : *pos0 + t;
     const size_t rb0 = rbase ? (size_t)rbase[t] : 0;
-    if (rbase && !km.pt) kv_region<K4>(rb0, kc, vc, ks, vs);
+    if (rbase && !km.pt && !km.period_map) kv_region<K4>(rb0, kc, vc, ks, vs);
     const int kvo = (nqp + (p.q1 - p.q0)) * HD;
     const float* src;
     const bf16* w = nullptr;
@@ -1457,7 +1495,10 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
     if (h >= NQ) {  // k / v -> cache if owned (fp8 e4m3, scale per (row, head))
         const int row = own_row(p, pos);
         if (row < 0) return;
-        if constexpr (K4) {  // 4-bit: nibble byte d / 2 from the even threads, the group's fp16 scale from lane 0 of each warp
+        
+        
+    kv_assert_writable(km, rb0 + (size_t)row);
+    if constexpr (K4) {  // 4-bit: nibble byte d / 2 from the even threads, the group's fp16 scale from lane 0 of each warp
             int n;
             unsigned short sb;
             kv4_code(x, n, sb);
@@ -1467,7 +1508,7 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
             const bool isk = h < NQ + 2;
             const bool wb = !(d & 1), ws = (d & 31) == 0;
             if (km.pt) {  // streaming: the host row always (write-through), the cached block's row when it is resident
-                const size_t g = rb0 + (size_t)row;
+                const size_t g =   kv_phys_row(km, rb0 + (size_t)row);
                 if (wb) __stwt((isk ? km.hk : km.hv) + (g * NKV + kvh) * (HD / 2) + (d >> 1), byte);
                 if (ws) __stwt(reinterpret_cast<unsigned short*>(isk ? km.hks : km.hvs) + (g * NKV + kvh) * 8 + (d >> 5), sb);
                 const int b = km.pt[g >> 2];
@@ -1477,8 +1518,12 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
                 if (ws) reinterpret_cast<unsigned short*>(isk ? ks : vs)[(pr * NKV + kvh) * 8 + (d >> 5)] = sb;
                 return;
             }
-            if (wb) (isk ? kc : vc)[((size_t)row * NKV + kvh) * (HD / 2) + (d >> 1)] = byte;
-            if (ws) reinterpret_cast<unsigned short*>(isk ? ks : vs)[((size_t)row * NKV + kvh) * 8 + (d >> 5)] = sb;
+            
+            
+      const size_t pr =
+          km.period_map ? kv_phys_row(km, rb0 + (size_t)row) : (size_t)row;
+      if (wb) (isk ? kc : vc)[(pr * NKV + kvh) * (HD / 2) + (d >> 1)] = byte;
+            if (ws) reinterpret_cast<unsigned short*>(isk ? ks : vs)[(pr * NKV + kvh) * 8 + (d >> 5)] = sb;
             return;
         }
 #if QE_KV4_EMU
@@ -1491,7 +1536,7 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
         __nv_fp8_e4m3 q8(x / sc);
         const uint8_t q8b = *reinterpret_cast<uint8_t*>(&q8);
         if (km.pt) {  // streaming: the host row always (write-through), the cached block's row when it is resident
-            const size_t g = rb0 + (size_t)row;
+            const size_t g =   kv_phys_row(km, rb0 + (size_t)row);
             __stwt((isk ? km.hk : km.hv) + (g * NKV + kvh) * HD + d, q8b);
             if (d == 0) __stwt((isk ? km.hks : km.hvs) + g * NKV + kvh, sc);
             const int b = km.pt[g >> 2];
@@ -1501,19 +1546,23 @@ __global__ void k_qsa_prep(const float* __restrict__ proj, int ld, const bf16* _
             if (d == 0) (isk ? ks : vs)[pr * NKV + kvh] = sc;
             return;
         }
-        (isk ? kc : vc)[((size_t)row * NKV + kvh) * HD + d] = q8b;
-        if (d == 0) (isk ? ks : vs)[row * NKV + kvh] = sc;
+        
+        
+    const size_t pr =
+        km.period_map ? kv_phys_row(km, rb0 + (size_t)row) : (size_t)row;
+    (isk ? kc : vc)[(pr * NKV + kvh) * HD + d] = q8b;
+        if (d == 0) (isk ? ks : vs)[pr * NKV + kvh] = sc;
     }
 }
 // indexer: q heads (layernorm 1 + w, RoPE at pos), raw key into the tail ring; a completed block of 4 is pooled
 // (mean, layernorm, RoPE at the block start) and stored by its owner. Rows in order: one block, 128 threads.
 __global__ void k_idx_prep(const float* __restrict__ ip, int ld, const bf16* __restrict__ qn, const bf16* __restrict__ kn,
                            const int* __restrict__ pos0, float* __restrict__ iq, float* __restrict__ tail,
-                           bf16* __restrict__ ikb, Plan p, int m, const int* __restrict__ kvb0 = nullptr) {
+                           bf16* __restrict__ ikb, Plan p, int m, const int* __restrict__ kvb0 = nullptr, KvMap hm = {}) {
     __shared__ float red[32];
     __shared__ float xs[IDX_HD];
     const int d = threadIdx.x;
-    if (kvb0) ikb += (size_t)(*kvb0 / IDX_R) * IDX_HD;  // slot region (rows)
+    const size_t ibase =kvb0? (size_t)(*kvb0 / IDX_R) : 0;  // slot region (rows)
     auto norm_rope = [&](float x, const bf16* w, int pos) {
         const float ss = block_sum<128>(x * x, red);
         x = x * rsqrtf(ss / IDX_HD + EPS) * (1.f + __bfloat162float(w[d]));
@@ -1541,8 +1590,14 @@ __global__ void k_idx_prep(const float* __restrict__ ip, int ld, const bf16* __r
             const float pooled = __bfloat162float(__float2bfloat16(s * 0.25f));
             const float kr = norm_rope(pooled, kn, pos - 3);
             const int row = own_row(p, pos - 3);
-            if (row >= 0) ikb[(size_t)(row >> 2) * IDX_HD + d] = __float2bfloat16(kr);
-        }
+            if (row >= 0) {
+        kv_assert_writable(hm, ibase * IDX_R + (size_t)row);
+        const size_t b = kv_phys_block(hm, ibase +(size_t)(row >> 2)  );
+        ikb[b * IDX_HD + d] = __float2bfloat16(kr);
+        
+        
+      }
+    }
         __syncthreads();
     }
 }
@@ -1551,12 +1606,12 @@ __global__ void k_idx_prep(const float* __restrict__ ip, int ld, const bf16* __r
 // (last raw keys of the chunk) is k_idx_tail, launched after.
 __global__ void k_idx_prep_rows(const float* __restrict__ ip, int ld, const bf16* __restrict__ qn, const bf16* __restrict__ kn,
                                 const int* __restrict__ pos0, float* __restrict__ iq, const float* __restrict__ tail,
-                                bf16* __restrict__ ikb, Plan p, const int* __restrict__ kvb0 = nullptr) {
+                                bf16* __restrict__ ikb, Plan p, const int* __restrict__ kvb0 = nullptr, KvMap hm = {}) {
     __shared__ float red[32];
     __shared__ float xs[IDX_HD];
     const int d = threadIdx.x, t = blockIdx.x;
     const int pos = *pos0 + t;
-    if (kvb0) ikb += (size_t)(*kvb0 / IDX_R) * IDX_HD;  // slot region (rows)
+    const size_t ibase =kvb0? (size_t)(*kvb0 / IDX_R) : 0;  // slot region (rows)
     auto norm_rope = [&](float x, const bf16* w, int ps) {
         const float ss = block_sum<128>(x * x, red);
         x = x * rsqrtf(ss / IDX_HD + EPS) * (1.f + __bfloat162float(w[d]));
@@ -1582,8 +1637,14 @@ __global__ void k_idx_prep_rows(const float* __restrict__ ip, int ld, const bf16
         const float pooled = __bfloat162float(__float2bfloat16(s * 0.25f));
         const float kr = norm_rope(pooled, kn, pos - 3);
         const int row = own_row(p, pos - 3);
-        if (row >= 0) ikb[(size_t)(row >> 2) * IDX_HD + d] = __float2bfloat16(kr);
+        if (row >= 0) {
+      kv_assert_writable(hm, ibase * IDX_R + (size_t)row);
+      const size_t b = kv_phys_block(hm, ibase +(size_t)(row >> 2)  );
+      ikb[b * IDX_HD + d] = __float2bfloat16(kr);
+    
+    
     }
+  }
 }
 __global__ void k_idx_tail(const float* __restrict__ ip, int ld, const int* __restrict__ pos0, float* __restrict__ tail, int m) {
     const int d = threadIdx.x;
@@ -1595,12 +1656,14 @@ __global__ void k_idx_tail(const float* __restrict__ ip, int ld, const int* __re
 // every key selected). out row [24][HD + 2]: unnormalized sum, max, sum of exp. grid (24, m), 256 threads.
 __global__ void k_qsa_attn(const float* __restrict__ qb, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
                            const float* __restrict__ ks, const float* __restrict__ vs, const int* __restrict__ pos0,
-                           float* __restrict__ out, Plan p, const int* __restrict__ kvb0 = nullptr) {
+                           float* __restrict__ out, Plan p, const int* __restrict__ kvb0 = nullptr, KvMap km = {}) {
     __shared__ float qs[HD];
     __shared__ float wm[8], wl[8];
     __shared__ float wacc[8][HD];
     const int h = blockIdx.x, t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
+     const size_t rb =   kvb0 ? (size_t)*kvb0 : 0;  
+  if (kvb0 && !km.pt && !km.period_map)
+    kv_region<>(rb, kc , vc, ks, vs);   // slot region
     const int kvh = h / (NQ / NKV);
     const int pos = *pos0 + t;
     qs[threadIdx.x] = qb[((size_t)t * (NQ + 4) + h) * HD + threadIdx.x] * (1.f / 16.f);
@@ -1613,7 +1676,10 @@ __global__ void k_qsa_attn(const float* __restrict__ qb, const uint8_t* __restri
     const int nper = pos / p.period, rem = pos % p.period - p.own0;
     const int nrows = nper * p.own + (rem < 0 ? 0 : min(rem + 1, p.own));
     for (int r = warp; r < nrows; r += 8) {
-        const uint8_t* kr = kc + ((size_t)r * NKV + kvh) * HD + lane * 8;
+        const uint8_t*  krp, *vrp;
+    const float *ksrp, *vsrp;
+    kv_rowp(km, kc, vc, ks, vs, rb, r, kvh, krp, vrp, ksrp, vsrp);
+    const uint8_t *kr = krp + lane * 8;
         const uint2 kw = *reinterpret_cast<const uint2*>(kr);
         const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
         float s = 0.f;
@@ -1621,13 +1687,13 @@ __global__ void k_qsa_attn(const float* __restrict__ qb, const uint8_t* __restri
         for (int e = 0; e < 8; e++) s += q8[e] * float(*reinterpret_cast<const __nv_fp8_e4m3*>(kb + e));
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-        s *= ks[r * NKV + kvh];
+        s *=  * ksrp;
         const float nm = fmaxf(mx, s);
         const float c = __expf(mx - nm), e1 = __expf(s - nm);
         l = l * c + e1;
-        const uint2 vw = *reinterpret_cast<const uint2*>(vc + ((size_t)r * NKV + kvh) * HD + lane * 8);
+        const uint2 vw = *reinterpret_cast<const uint2*>(vrp + lane * 8);
         const uint8_t* vb = reinterpret_cast<const uint8_t*>(&vw);
-        const float vsc = vs[r * NKV + kvh] * e1;
+        const float vsc =  * vsrp * e1;
 #pragma unroll
         for (int e = 0; e < 8; e++) acc[e] = acc[e] * c + vsc * float(*reinterpret_cast<const __nv_fp8_e4m3*>(vb + e));
         mx = nm;
@@ -2017,7 +2083,8 @@ __device__ __forceinline__ void kv_need_ents(const KvPool& kp, unsigned id, size
     const int lane = threadIdx.x & 31;
     const int ne = ns + (tb1 - tb0);
     for (int e = warp0; e < ne; e += nw) {
-        const int b = (int)(rb / IDX_R) + (e < ns ? sel[e] : tb0 + (e - ns));  // logical block
+        const size_t lb = rb / IDX_R + (e < ns ?   (size_t)sel[e] :   (size_t)(tb0 + (e - ns)));
+    const int b = (int)kv_phys_block(kp.m, lb);  // logical block
         int phys = -1, res = -(b + 1);
         bool load = false;
         if (lane == 0) {
@@ -2152,18 +2219,19 @@ __global__ void k_kv_inval(KvPool kp, int b0, int b1) {
 // more than IDX_TOPB complete blocks visible). grid (ceil(lbmax / 256), m)
 __global__ void k_idx_score(const bf16* __restrict__ ikb, const float* __restrict__ iq, const int* __restrict__ pos0,
                             Plan p, int lbmax, float* __restrict__ scores, const int* __restrict__ rpos = nullptr,
-                            const int* __restrict__ rbase = nullptr) {
+                            const int* __restrict__ rbase = nullptr, KvMap hm = {}) {
     __shared__ float qs[IDX_NH * IDX_HD];
     const int t = blockIdx.y;
     const int pos = rpos ? rpos[t] : *pos0 + t, nbg = (pos + 1) / IDX_R;
-    if (rbase) ikb += (size_t)(rbase[t] / IDX_R) * IDX_HD;
+    const size_t ibase =rbase? (size_t)(rbase[t] / IDX_R) : 0;
     if (nbg <= IDX_TOPB) return;
     for (int i = threadIdx.x; i < IDX_NH * IDX_HD; i += blockDim.x) qs[i] = iq[(size_t)t * IDX_NH * IDX_HD + i];
     __syncthreads();
     const int nlb = owned_upto(p, IDX_R * nbg - 1) / IDX_R;
     const int lb = blockIdx.x * blockDim.x + threadIdx.x;
     if (lb >= nlb) return;
-    const uint4* kp = reinterpret_cast<const uint4*>(ikb + (size_t)lb * IDX_HD);
+    const   size_t b = kv_phys_block(hm, ibase + (size_t)lb);
+  const uint4* kp = reinterpret_cast<const uint4*>(ikb + b * IDX_HD);
     float acc[IDX_NH] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll 4
     for (int c = 0; c < IDX_HD / 8; c++) {
@@ -2188,9 +2256,9 @@ constexpr int IS_ROWS = 16, IS_BLK = 64;
 constexpr size_t IS_SMEM = (size_t)(IS_ROWS * IDX_NH * IDX_HD + IDX_HD * (IS_BLK + 1)) * 4;
 __global__ void __launch_bounds__(256) k_idx_score_t(const bf16* __restrict__ ikb, const float* __restrict__ iq,
                                                      const int* __restrict__ pos0, Plan p, int lbmax, int m,
-                                                     float* __restrict__ scores, const int* __restrict__ kvb0 = nullptr) {
+                                                     float* __restrict__ scores, const int* __restrict__ kvb0 = nullptr, KvMap hm = {}) {
     extern __shared__ float is_sm[];
-    if (kvb0) ikb += (size_t)(*kvb0 / IDX_R) * IDX_HD;  // slot region (rows, uniform)
+    const size_t ibase =kvb0? (size_t)(*kvb0 / IDX_R) : 0;  // slot region (rows, uniform)
     float* qs = is_sm;                                // [16 rows][4 heads][128]
     float* ks = is_sm + IS_ROWS * IDX_NH * IDX_HD;    // [128][65] (transposed, padded)
     const int r0 = blockIdx.y * IS_ROWS, b0 = blockIdx.x * IS_BLK, tid = threadIdx.x;
@@ -2206,8 +2274,13 @@ __global__ void __launch_bounds__(256) k_idx_score_t(const bf16* __restrict__ ik
     for (int i = tid; i < IS_BLK * IDX_HD / 8; i += 256) {
         const int b = i / (IDX_HD / 8), c = i % (IDX_HD / 8);
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if (b0 + b < lbmax) v = *reinterpret_cast<const uint4*>(ikb + (size_t)(b0 + b) * IDX_HD + c * 8);
-        const bf16* kb = reinterpret_cast<const bf16*>(&v);
+        if (b0 + b < lbmax)   {
+      const size_t pb = kv_phys_block(hm, ibase + (size_t)(b0 + b));
+      v = *reinterpret_cast<const uint4*>(ikb + pb * IDX_HD + c * 8);
+        
+        
+    }
+    const bf16* kb = reinterpret_cast<const bf16*>(&v);
 #pragma unroll
         for (int e = 0; e < 8; e++) ks[(c * 8 + e) * (IS_BLK + 1) + b] = __bfloat162float(kb[e]);
     }
@@ -2261,10 +2334,10 @@ __device__ __forceinline__ uint32_t bf2_pack(float a, float b) {
 }
 __global__ void __launch_bounds__(256) k_idx_score_mma(const bf16* __restrict__ ikb, const float* __restrict__ iq,
                                                        const int* __restrict__ pos0, Plan p, int lbmax, int m,
-                                                       float* __restrict__ scores, const int* __restrict__ kvb0 = nullptr) {
+                                                       float* __restrict__ scores, const int* __restrict__ kvb0 = nullptr, KvMap hm = {}) {
     extern __shared__ __align__(16) unsigned char it_sm[];
     bf16* Ks = reinterpret_cast<bf16*>(it_sm);  // [IT_BLK][IT_SROW]
-    if (kvb0) ikb += (size_t)(*kvb0 / IDX_R) * IDX_HD;
+    const size_t ibase =kvb0? (size_t)(*kvb0 / IDX_R) : 0;
     const int r0 = blockIdx.y * IT_ROWS, b0 = blockIdx.x * IT_BLK, tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
     const int rl = min(m, r0 + IT_ROWS) - 1;
@@ -2276,7 +2349,8 @@ __global__ void __launch_bounds__(256) k_idx_score_mma(const bf16* __restrict__ 
         const int b = i >> 4, c = i & 15;
         const unsigned dst = (unsigned)__cvta_generic_to_shared(Ks + b * IT_SROW + c * 8);
         if (b0 + b < min(lbmax, nlbl))  // (live blocks only: no read past the tile's last visible block, review L1)
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(ikb + (size_t)(b0 + b) * IDX_HD + c * 8));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(ikb +  
+                       kv_phys_block(hm, ibase + (size_t)(b0 + b)) * IDX_HD + c * 8));
         else
             *reinterpret_cast<uint4*>(Ks + b * IT_SROW + c * 8) = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -2766,12 +2840,14 @@ __global__ void k_qsa_comb16(const float* __restrict__ part, int m, const float*
 __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
                              const float* __restrict__ ks, const float* __restrict__ vs, const int* __restrict__ pos0,
                              float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel,
-                             const int* __restrict__ nsel, int lbmax, const int* __restrict__ kvb0 = nullptr) {
+                             const int* __restrict__ nsel, int lbmax, const int* __restrict__ kvb0 = nullptr, KvMap km = {}) {
     __shared__ float qs[HD];
     __shared__ float wm[8], wl[8];
     __shared__ float wacc[8][HD];
     __shared__ unsigned s_s;
-    if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
+     const size_t rb =   kvb0 ? (size_t)*kvb0 : 0;  
+  if (kvb0 && !km.pt && !km.period_map) {
+    kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     const int h = blockIdx.x, t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int owner = h / QPC(p);
     if (threadIdx.x == 0) {
@@ -2798,20 +2874,23 @@ __global__ void k_qsa_attn_b(const float* __restrict__ qb, const uint8_t* __rest
     const int nit = ns < 0 ? nrows_all : ns * IDX_R + (nrows_all - rc);
     for (int it = warp; it < nit; it += 8) {
         const int r = ns < 0 ? it : (it < ns * IDX_R ? sel[(size_t)t * lbmax + it / IDX_R] * IDX_R + it % IDX_R : rc + it - ns * IDX_R);
-        const uint2 kw = *reinterpret_cast<const uint2*>(kc + ((size_t)r * NKV + kvh) * HD + lane * 8);
+        const   uint8_t *krp, *vrp;
+    const float *ksrp, *vsrp;
+    kv_rowp(km, kc, vc, ks, vs, rb, r, kvh, krp, vrp, ksrp, vsrp);
+    const uint2 kw = *reinterpret_cast<const uint2*>(krp + lane * 8);
         const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
         float sc = 0.f;
 #pragma unroll
         for (int e = 0; e < 8; e++) sc += q8[e] * float(*reinterpret_cast<const __nv_fp8_e4m3*>(kb + e));
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) sc += __shfl_xor_sync(0xffffffffu, sc, o);
-        sc *= ks[r * NKV + kvh];
+        sc *=  * ksrp;
         const float nm = fmaxf(mx, sc);
         const float c = __expf(mx - nm), e1 = __expf(sc - nm);
         l = l * c + e1;
-        const uint2 vw = *reinterpret_cast<const uint2*>(vc + ((size_t)r * NKV + kvh) * HD + lane * 8);
+        const uint2 vw = *reinterpret_cast<const uint2*>(vrp + lane * 8);
         const uint8_t* vb = reinterpret_cast<const uint8_t*>(&vw);
-        const float vsc = vs[r * NKV + kvh] * e1;
+        const float vsc =  * vsrp * e1;
 #pragma unroll
         for (int e = 0; e < 8; e++) acc[e] = acc[e] * c + vsc * float(*reinterpret_cast<const __nv_fp8_e4m3*>(vb + e));
         mx = nm;
@@ -2848,9 +2927,11 @@ __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__
                                                        const float* __restrict__ vs, const int* __restrict__ pos0,
                                                        float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, const int* __restrict__ sel,
                                                        const int* __restrict__ nsel, int lbmax, int m,
-                                                       const int* __restrict__ kvb0 = nullptr) {
+                                                       const int* __restrict__ kvb0 = nullptr, KvMap km = {}) {
     __shared__ unsigned s_s;
-    if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
+     const size_t rb =   kvb0 ? (size_t)*kvb0 : 0;  
+  if (kvb0 && !km.pt && !km.period_map) {
+    kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int t = blockIdx.y * 8 + warp;
     const int owner = h / QPC(p);
@@ -2876,9 +2957,12 @@ __global__ void __launch_bounds__(256) k_qsa_attn_rows(const float* __restrict__
         float mx = -INFINITY, l = 0.f, acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int it = 0; it < nit; it++) {
             const int r = ns < 0 ? it : (it < ns * IDX_R ? sel[(size_t)t * lbmax + it / IDX_R] * IDX_R + it % IDX_R : rc + it - ns * IDX_R);
-            const uint2 kw = *reinterpret_cast<const uint2*>(kc + ((size_t)r * NKV + kvh) * HD + lane * 8);
-            const uint2 vw = *reinterpret_cast<const uint2*>(vc + ((size_t)r * NKV + kvh) * HD + lane * 8);
-            const float ksc = ks[r * NKV + kvh], vsc0 = vs[r * NKV + kvh];
+            const   uint8_t *krp, *vrp;
+      const float *ksrp, *vsrp;
+      kv_rowp(km, kc, vc, ks, vs, rb, r, kvh, krp, vrp, ksrp, vsrp);
+      const uint2 kw = *reinterpret_cast<const uint2*>(krp + lane * 8);
+            const uint2 vw = *reinterpret_cast<const uint2*>(vrp + lane * 8);
+            const float ksc =  * ksrp, vsc0 =  * vsrp;
             const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
             float sc = 0.f;
 #pragma unroll
@@ -2931,9 +3015,11 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
                                                      const uint8_t* __restrict__ vc, const float* __restrict__ ks,
                                                      const float* __restrict__ vs, const int* __restrict__ pos0,
                                                      float* __restrict__ out, Plan p, const __grid_constant__ Xchg xq, int m,
-                                                     const int* __restrict__ kvb0 = nullptr) {
+                                                     const int* __restrict__ kvb0 = nullptr, KvMap km = {}) {
     extern __shared__ __align__(16) unsigned char ta_sm[];
-    if (kvb0) { const size_t rb = *kvb0; kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
+     const size_t rb =   kvb0 ? (size_t)*kvb0 : 0;  
+  if (kvb0 && !km.pt && !km.period_map) {
+    kc += rb * NKV * HD; vc += rb * NKV * HD; ks += rb * NKV; vs += rb * NKV; }  // slot region
     __half* Qs = reinterpret_cast<__half*>(ta_sm);
     __half* Ks = Qs + TA_ROWS * TA_SROW;
     __half* Vs = Ks + TA_KEYS * TA_SROW;
@@ -2977,9 +3063,14 @@ __global__ void __launch_bounds__(128) k_qsa_attn_tc(const float* __restrict__ q
             uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
             float vsc = 0.f;
             if (r < kend) {
-                kw = *reinterpret_cast<const uint4*>(kc + ((size_t)r * NKV + kvh) * HD + ch * 16);
-                vw = *reinterpret_cast<const uint4*>(vc + ((size_t)r * NKV + kvh) * HD + ch * 16);
-                vsc = vs[r * NKV + kvh];
+                
+                
+        const uint8_t *krp, *vrp;
+        const float *ksrp, *vsrp;
+        kv_rowp(km, kc, vc, ks, vs, rb, r, kvh, krp, vrp, ksrp, vsrp);
+        kw = *reinterpret_cast<const uint4*>(krp + ch * 16);
+                vw = *reinterpret_cast<const uint4*>(vrp + ch * 16);
+                vsc =  * vsrp;
             }
             const unsigned short* kb = reinterpret_cast<const unsigned short*>(&kw);
             const unsigned short* vb = reinterpret_cast<const unsigned short*>(&vw);
@@ -3118,7 +3209,7 @@ __global__ void __launch_bounds__(64 * RG) k_qsa_attn_tc2(const float* __restric
                                                       const int* __restrict__ kvb0 = nullptr, KvMap km = KvMap()) {
     extern __shared__ __align__(16) unsigned char ta_sm[];
     const size_t rb0 = kvb0 ? (size_t)*kvb0 : 0;
-    if (kvb0 && !km.pt) kv_region<K4>(rb0, kc, vc, ks, vs);  // slot region
+    if (kvb0 && !km.pt && !km.period_map) kv_region<K4>(rb0, kc, vc, ks, vs);  // slot region
     __half* Ks = reinterpret_cast<__half*>(ta_sm);
     __half* Vs = Ks + TB_KEYS * TA_SROW;
     float* kss = reinterpret_cast<float*>(Vs + TB_KEYS * TA_SROW);
@@ -3529,7 +3620,7 @@ __global__ void __launch_bounds__(128) k_qsa_dec(const float* __restrict__ qb, c
         }
     }
     const size_t rb0 = rbase ? (size_t)rbase[t] : 0;
-    if (rbase && !km.pt) kv_region<K4>(rb0, kc, vc, ks, vs);
+    if (rbase && !km.pt && !km.period_map) kv_region<K4>(rb0, kc, vc, ks, vs);
     auto key_row = [&](int it) { return ns < 0 ? it : (it < ns * IDX_R ? sel[(size_t)t * lbmax + it / IDX_R] * IDX_R + it % IDX_R : rc + it - ns * IDX_R); };
     const int cz0 = chunk ? z * S0 / S : z, cz1 = chunk ? (z + 1) * S0 / S : z + 1;
     for (int cz = cz0; cz < cz1; cz++) {

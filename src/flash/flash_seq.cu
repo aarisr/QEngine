@@ -30,7 +30,12 @@ int Worker::kv_rows(int ntok) const {
 void Worker::kv_pieces(int t0, int t1, std::vector<Piece>& out) { kv_pieces_at(cur_base_, t0, t1, out); }
 
 void Worker::kv_pieces_at(int base, int t0, int t1, std::vector<Piece>& out) {
-    const int r0 = kv_rows(t0), r1 = kv_rows(t1);
+    
+  if (live_period_d_) {
+    live_pieces(base, t0, t1, out);
+    return;
+  }
+  const int r0 = kv_rows(t0), r1 = kv_rows(t1);
     if (r1 <= r0) return;
     const size_t rb = (size_t)base * p_.own;  // region start row
     // pooled indexer keys: blocks of 4 rows; a block cut by r0 is copied again (its pooled key may have changed)
@@ -282,7 +287,7 @@ void Worker::bind_slot(int s, int base) {
         CUDA_CHECK(cudaMemcpyAsync(steer_csc_d_, &steer_sc_h_.at(s), 4, cudaMemcpyHostToDevice, st_));
     }
     CUDA_CHECK(cudaStreamSynchronize(st_));
-    ctx_off_ = (long long)base * p_.period;
+    ctx_off_ =  live_period_d_ ? 0 : (long long)base * p_.period;
 }
 
 // workspace <-> slot storage (D2D, ~70 MB per card)
@@ -712,7 +717,12 @@ void Worker::reset_slot(int s) {
 
 void Worker::kv_move(int from, int to, int ntok) {
     if (from == to || ntok <= 0) return;
-    CUDA_CHECK(cudaSetDevice(dev_));
+    
+  if (live_period_d_) {
+    live_move(from, to, ntok);
+    return;
+  }
+  CUDA_CHECK(cudaSetDevice(dev_));
     const int nr = kv_rows(ntok);
     const size_t row = (size_t)NKV * kv_hb(), sr = (size_t)NKV * kv_sf();  // K / V bytes, scale floats per row
     const int shift = std::abs(from - to) * p_.own;

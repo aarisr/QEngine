@@ -160,10 +160,8 @@ void FE::sp_publish_sync(Pin&& p) {
 bool FE::sp_fits(const sp::Desc& d) {
     if (d.ng != ng) return false;
     for (int r = 0; r < ng; r++) {
+        if (W[r]->kv_bytes(0, (int)d.toks.size()) != d.kv[r].len) return false;
         std::vector<Worker::Piece> ps;
-        W[r]->kv_pieces_at(0, 0, (int)d.toks.size(), ps);
-        if (bytes_of(ps) != d.kv[r].len) return false;
-        ps.clear();
         W[r]->state_pieces_of(0, false, ps);
         if (bytes_of(ps) != d.st[r].len) return false;
     }

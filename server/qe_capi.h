@@ -46,7 +46,10 @@ void qe_prefill_cancel(void* e, int slot);  // optional: the client of the slot'
 // ======================================================= TIER 1: single functions (each optional)
 int qe_vocab(void* e);                       // logits width (248320); else config.json vocab_size
 int qe_num_slots(void* e);                   // default 1; > 1 requires tiers 2 + 3
-long long qe_pool_tokens(void* e);           // KV pool size in tokens, all slots together; default max_context
+long long qe_pool_tokens(
+    void *e); // KV pool size in tokens, all slots together; default max_context
+long long
+qe_live_prefix_positions(void* e);           // KV pool size in tokens, all slots together; default max_context
 int qe_kv_in_ram(void* e);                   // 1: the KV cache lives in host RAM (Flash-Next FLASH_KV=ram); default 0 (VRAM)
 int qe_host_mem_info(void* e, char* buf, int n);  // the host-RAM plan at boot as JSON (/api/stats host_memory); -1: too small
 int qe_can_admit(void* e, int n);            // a new n-token sequence fits now; default: a free slot and n <= max_context

@@ -13,6 +13,8 @@
 #include "kv_arith.h"
 #include "../pool_order.h"
 #include "../kernels/watchdog.cuh"
+
+#include "live_prefix.h"
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -435,7 +437,10 @@ struct PpHy {
 };
 
 struct FE {
-    std::vector<int> devs;
+    
+
+#include "live_prefix_fe.inc"
+  std::vector<int> devs;
     int ng = 3, ctx = 0, kmax = 3;
     SafeTensors st, mst;
     HostTables ht;
@@ -937,6 +942,10 @@ struct FE {
     int periods_for(std::int64_t tokens) const { return static_cast<int>(flash::kv_math::periods_for_tokens(tokens, period)); }
     // KV in RAM (lazy pinning): the pool may grow to what the host can still pin; never below the regions in use
     void refresh_np() {
+        if (live_on) {
+            np = live_arena->capacity();
+            return;
+        }
         int top = 0;
         for (auto& q : sl) if (q.cap) top = std::max(top, q.base + q.cap);
         int v = W[0]->periods();
@@ -944,6 +953,10 @@ struct FE {
         np = std::max(top, v);
     }
     void update_top() {
+        if (live_on) {
+            live_update_top();
+            return;
+        }
         int top = 0;
         long long act = 0;
         for (auto& q : sl) {
@@ -1079,7 +1092,11 @@ struct FE {
     // region of slot s holds `tokens` positions (+ reserve): grows in place, moves to a gap, packs the others or
     // evicts idle slots (not `protect`); the slot bound to the single-sequence path is re-bound after any move
     bool ensure_region(int s, int tokens, const std::vector<int>& protect = {}) {
-        refresh_np();
+        
+
+    if (live_on)
+      return live_ensure(s, tokens, protect);
+    refresh_np();
         Slot& q = sl[s];
         if (static_cast<std::int64_t>(tokens) > flash::kv_math::capacity_tokens(np, period)) return false;
         const std::int64_t requested = static_cast<std::int64_t>(tokens) + reserve;
@@ -1299,7 +1316,10 @@ struct FE {
             }
         }
         n_slot_evict++;
-        q = Slot{};
+        
+
+    live_drop(s);
+    q = Slot{};
     }
     // ---- KV in VRAM: the expert cache lives in the pool above the highest region (update_top), so an idle
     // conversation's region takes expert-cache slots from the sequences decoding next to it (2 GPUs, c=8 after 4 x 90K
@@ -1437,7 +1457,14 @@ struct FE {
         CHECK(g.layout == layout, "flash archive: a segment of layout %d restored into layout %d", g.layout, layout);
         const int z2 = std::min(z, upto);
         if (z2 <= a) return;
-        job = [&](int r) {
+        
+
+    if (live_on) {
+      job = [&](int r) { W[r]->live_restore(g.p[r], b, a, z, z2, false); };
+      run("live prefix restore");
+      return;
+    }
+    job = [&](int r) {
             CUDA_CHECK(cudaSetDevice(W[r]->device()));
             std::vector<Worker::Piece> full, part;
             W[r]->kv_pieces_at(b, a, z, full);
@@ -2461,11 +2488,10 @@ struct FE {
         for (const char* v : {"FLASH_NGRAM", "FLASH_ROUTE", "FLASH_ROUTER8"})
             if (const char* x = env_str(v)) fp << "|" << v << "=" << x;
         for (int r = 0; r < ng; r++) {
-            std::vector<Worker::Piece> a, b, c;
-            W[r]->kv_pieces_at(0, 0, period, a);
+            std::vector<Worker::Piece>  b, c;
             W[r]->state_pieces_of(0, false, b);
             W[r]->state_pieces_of(0, true, c);
-            fp << "|" << bytes_of(a) << "," << bytes_of(b) << "," << bytes_of(c);
+            fp << "|" << W[r]->kv_bytes(0, period) << "," << bytes_of(b) << "," << bytes_of(c);
         }
         return fp.str();
     }
@@ -2475,9 +2501,15 @@ struct FE {
         for (auto& b : m.blobs)
             for (int r = 0; r < ng; r++) {
                 std::vector<Worker::Piece> ps;
-                if (b.kind == kvd::KV_SEG) W[r]->kv_pieces_at(0, b.a, b.b, ps);
-                else W[r]->state_pieces_of(0, b.pend != 0, ps);
-                if (bytes_of(ps) != b.size[r]) return false;
+                
+        size_t expected = 0;
+        if (b.kind == kvd::KV_SEG) 
+          expected = W[r]->kv_bytes( b.a, b.b);
+                else  {
+          W[r]->state_pieces_of(0, b.pend != 0, ps);
+                expected =bytes_of(ps) ;
+        }
+        if (expected != b.size[r]) return false;
             }
         return true;
     }
@@ -2585,7 +2617,7 @@ struct FE {
         // a pinned prefix (host copy, like an archived checkpoint): only when no conversation offers as much
         for (auto& x : pins) {
             const int P = x.toks.size();
-            if (x.steer != sk || P >= n || P < b.L || (P == b.L && b.c)) continue;
+            if (x.steer != sk || P >= n || P < b.L || (P == b.L && b.c && (!live_on || b.live))) continue;
             if (!std::equal(x.toks.begin(), x.toks.end(), ids)) continue;
             maxm = std::max(maxm, P);
             b = Src{nullptr, P, x.st, false};
@@ -2624,7 +2656,9 @@ struct FE {
         if (log)
             fprintf(stderr, "[qflash] pool: slot %d paused at %d tokens (prio %d; %d of them from steps run ahead), region [%d, %d) freed\n",
                     v, hn, prio_of(v), hn - hn0, q.base, q.base + q.cap);
-        q.cap = 0;
+        
+    live_drop(v);
+    q.cap = 0;
         q.paused = true;
         q.pause_t = ++pause_tick;
         q.bhist = -1;
@@ -2645,7 +2679,10 @@ struct FE {
             held += x.cap;
             if (!prefilling(j)) deficit += std::max(0, floor_of(x) - x.cap);
         }
-        if (held + deficit + floor_of(q) > np) return false;
+        
+    if (live_on)
+      held = live_active_periods(false);
+    if (held + deficit + floor_of(q) > np) return false;
         std::vector<int> pr = protect;
         pr.push_back(v);
         if (!ensure_region(v, hn + MAXP + 2, pr)) return false;
@@ -2700,6 +2737,7 @@ struct FE {
         return -1;
     }
     ~FE() {
+        live_views.clear();  // source HBlobs must release before the HostPool member is destroyed
         if (sp_publish_queue) {
             sp_publish_queue->stop();
             fprintf(stderr, "[qflash] shared L2: async publisher stopped (dropped %llu publishes)\n",
@@ -4065,7 +4103,10 @@ void* qe_create(const char* model_dir, const char* devices, int max_t, const cha
                 e->ctx = (int)pool;
             }
         }
-        if (env_set("FLASH_CKPT_KEEP")) e->ckpt_keep = std::max(1, env_int("FLASH_CKPT_KEEP", e->ckpt_keep));
+        
+
+    e->live_init();
+    if (env_set("FLASH_CKPT_KEEP")) e->ckpt_keep = std::max(1, env_int("FLASH_CKPT_KEEP", e->ckpt_keep));
         e->ckpt_tail = std::max(0, std::min(8, env_int("FLASH_CKPT_TAIL", e->ckpt_tail)));
         e->ckpt_mark = env_int("FLASH_CKPT_MARK", e->ckpt_mark);
         e->tail_skip = std::max(0, env_int("FLASH_CKPT_TAIL_SKIP", e->tail_skip));
@@ -4259,10 +4300,23 @@ static int check_ids(const int* ids, int n, bool img = true) {
     return -1;
 }
 // a slot for a new sequence of n tokens (free, or the least valuable idle one evicted to the archive), with its region
-static int acquire_slot(FE* e, int n, const std::vector<int>& protect) {
+static int acquire_slot(FE* e, int n, const std::vector<int>& protect,
+                        Pin *pin = nullptr) {
     // the region can fit at all (next to the active and protected slots, which are never evicted)? Else refuse before
     // evicting anything: a refused start that waits for a running sequence must not push the idle ones out on every try
-    e->refresh_np();
+    
+  // the region can fit at all (next to the active and protected slots, which
+  // are never evicted)? Else refuse before evicting anything: a refused start
+  // that waits for a running sequence must not push the idle ones out on every
+  // try
+
+  if (e->live_on)
+    return e->live_acquire(n, protect, pin);
+  // the region can fit at all (next to the active and protected slots, which
+  // are never evicted)? Else refuse before evicting anything: a refused start
+  // that waits for a running sequence must not push the idle ones out on every
+  // try
+  e->refresh_np();
     if (n > e->np * e->period) return -1;
     {
         long long fixed = 0;
@@ -4300,7 +4354,13 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
     }
     int img_cnt = 0;
     for (int i = 0; i < n; i++) img_cnt += ids[i] >= kImgToken;
-    if (img_cnt && e->ppb && e->ppb->nstage() != e->ng) {
+    
+  if (img_cnt && e->live_on) {
+    fprintf(stderr, "[qflash] FLASH_KV_SHARE_PREFIX currently requires "
+                    "text-only prompts\n");
+    return QE_START_BAD_INPUT;
+  }
+  if (img_cnt && e->ppb && e->ppb->nstage() != e->ng) {
         fprintf(stderr, "[qflash] start: image prompts are not supported with FLASH_PAR=pptp; run with FLASH_PAR=tp or pp\n");
         return QE_START_BAD_INPUT;
     }
@@ -4452,7 +4512,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         // pin is held until the start has copied it (issue #3 D1: s.pin was read after it could have been erased)
         e->hold_pin = s.pin;
         struct Unhold { FE* e; ~Unhold() { e->hold_pin = nullptr; } } unhold{e};
-        y = acquire_slot(e, n, {});
+        y = acquire_slot(e, n, {}, s.pin);
         if (y < 0) return e->hold = nullptr, -1;
         pf.ms_pool = FE::now_ms() - t0;
         Pin& pn = *s.pin;
@@ -4472,7 +4532,7 @@ int qe_start_begin(void* p, const int* ids, int n, int k, unsigned long long aff
         target->ck.push_back(pn.st);
         pn.used = ++e->tick;
         e->n_pin_hit++;
-        e->last_copied = L;
+        e->last_copied = L - e->live_shared_tokens(y) + e->live_last_init_tokens;
         e->last_from_archive = true;
         e->n_restore++;
         pf.ms_restore = FE::now_ms() - t0 - pf.ms_pool;
@@ -6125,7 +6185,10 @@ int qe_drafts(void* p, int slot, int* out) {
 int qe_trim(void* p, int slot, int pos) {
     FE* e = (FE*)p;
     Slot& q = e->sl.at(slot);
-    e->ppb_settle();  // mode B: buffered steps join hist / rb_pos before they are read (review pp L1)
+    
+  if (e->live_on && pos < e->live_shared_tokens(slot))
+    return 0;
+  e->ppb_settle();  // mode B: buffered steps join hist / rb_pos before they are read (review pp L1)
     const int hn = q.hist.size();
     if (pos >= hn) return 1;  // nothing processed past pos (the last token is pending)
     if (q.rb_pos < 0 || pos < q.rb_pos || pos >= q.rb_pos + q.rb_rows) return 0;
@@ -6238,10 +6301,12 @@ void qe_reset(void* p) {
     for (int s = 0; s < (int)e->sl.size(); s++) {
         e->job = [&](int r) { e->W[r]->reset_slot(s); };
         e->run("qe_reset");
-        e->sl[s] = Slot{};
+        e->live_drop(s);
+    e->sl[s] = Slot{};
     }
     e->convs.clear();
     e->pins.clear();
+  e->live_index.clear();
     e->pin_used = 0;
     e->update_top();
     e->rebind();
@@ -6263,10 +6328,22 @@ long long qe_pool_tokens(void* p) {
     return std::max<long long>(e->ctx, (long long)v * e->period);
 }
 int qe_kv_in_ram(void* p) { return ((FE*)p)->W[0]->kv_stream() ? 1 : 0; }  // FLASH_KV=ram
+ // FLASH_KV=ram
+long long qe_live_prefix_positions(void *p) {
+  FE *e = (FE *)p;
+  if (e->live_on)
+    return (long long)e->live_arena->used() * e->period;
+  long long used = 0;
+  for (const auto &q : e->sl)
+    used += (long long)q.cap * e->period;
+  return used;
+}
 int qe_can_admit(void* p, int n) {
     FE* e = (FE*)p;
     e->refresh_np();
     if ((int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
+  if (e->live_on)
+    return e->live_can_admit(n);
     int act = 0, used = 0;
     for (auto& q : e->sl)
         if (q.active) { act++; used += q.paused ? e->floor_of(q) : q.cap; }
@@ -6284,6 +6361,8 @@ int qe_pause_for(void* p, int n, int cls) {
     FE* e = (FE*)p;
     e->refresh_np();
     if (!e->batch_api || !e->budget || (int)e->pfs.size() >= e->max_pf || n > e->ctx) return 0;
+  if (e->live_on)
+    return e->live_pause_for(n);
     int act = 0, used = 0;
     std::vector<int> vs;
     for (int i = 0; i < (int)e->sl.size(); i++) {
@@ -6373,9 +6452,9 @@ int qe_archive_more(void* p, long long budget) {
             // positions per call from the KV bytes per position of the busiest card (a full period)
             size_t per = 0;
             for (int r = 0; r < e->ng; r++) {
-                std::vector<Worker::Piece> ps;
-                e->W[r]->kv_pieces_at(0, 0, e->period, ps);
-                per = std::max(per, FE::bytes_of(ps));
+                
+        per = std::max(per,
+                e->W[r]->kv_bytes( 0, e->period));
             }
             const long long np = std::max<long long>(1, budget / std::max<size_t>(per, 1));
             const int upto = (int)std::min<long long>(hn, ((long long)q.conv->kv_n / e->period + np) * e->period);

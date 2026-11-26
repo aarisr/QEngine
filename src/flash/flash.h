@@ -100,6 +100,12 @@ struct KvMap {
     const int* pt = nullptr;
     uint8_t *hk = nullptr, *hv = nullptr;
     float *hks = nullptr, *hvs = nullptr;
+  const int *period_map =
+      nullptr;     // logical owned-row period -> physical pool period
+  int map_own = 0; // owned rows per period; zero when period_map is null
+  const int *prefix_periods =
+      nullptr; // immutable prefix periods indexed by slot
+  int slot_periods = 0;
 };
 // a layer's block cache (VRAM) and its residency state
 struct KvPool {
@@ -745,6 +751,18 @@ public:
     // drop their cached blocks in every layer (stream order)
     void kv_inval(int base, int t0, int t1);
 
+
+
+  void live_init(int stride, int capacity);
+  void live_map(int slot, const std::vector<int> &periods, int shared,
+                const std::vector<int> &added);
+  void live_pieces(int base, int t0, int t1, std::vector<Piece> &out);
+  void live_restore(const char *source, int base, int a, int z, int upto,
+                    bool initialize);
+  void live_inval(int base, int t0, int t1);
+  void live_move(int from, int to, int ntok);
+  size_t kv_bytes(int t0, int t1) const;
+
 private:
     struct SlotState {
         std::vector<float*> S, conv_hist, conv_pend, rec_pend, ple_hist, ple_pend, ik_tail;  // per layer (+ MTP ik_tail)
@@ -794,6 +812,10 @@ private:
     unsigned long long gtick_ = 0;
     std::vector<KvBase> kvb_;   // slot-0 (pool start) KV pointers per layer, MTP last
     int cur_slot_ = 0, cur_base_ = 0;
+  int live_stride_ = 0, live_capacity_ = 0;
+  int *live_period_d_ = nullptr;
+  int *live_shared_d_ = nullptr;
+  std::vector<int> live_period_h_, live_shared_h_;
     long long ctx_off_ = 0, kv_top_ = 0, kv_act_ = -1;  // expert cache: positions of the current region's start / of all regions
     void alloc_slots();
     void bind_slot(int s, int base);

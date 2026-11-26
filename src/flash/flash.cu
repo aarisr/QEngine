@@ -10,9 +10,13 @@
 #include <atomic>
 #include <cstring>
 #include "flash_kernels.cuh"
+#include   "live_prefix_layout.h"
 #include "flash_pfq.cuh"
 #include "../kernels/watchdog.cuh"
 #include "../gpu_diag.h"
+
+
+#include <climits>
 #include "../host_mem.h"
 #include "../host_pressure.h"
 #include <unistd.h>
@@ -4351,10 +4355,10 @@ void Worker::qsa_kv(Layer& L, int m) {
                                                    nqp, qh0, nullptr, rbcur_, nullptr, kvmap(L));
     KCHK("k_qsa_prep (kv only)");
     if (m > 8) {
-        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
+        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
         k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m); CUDA_TRACE_LAUNCH("k_idx_tail");
     } else{ 
-        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep"); }
+        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_prep"); }
     KCHK("k_idx_prep (kv only)");
 }
 
@@ -4380,7 +4384,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         CUDA_CHECK(cudaEventRecord(pfe0_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(pfs_, pfe0_, 0));
         gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, ist);
-        k_idx_prep<<<1, IDX_HD, 0, ist>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep");
+        k_idx_prep<<<1, IDX_HD, 0, ist>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_prep");
         CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
     }
     bool ijoined = !ip;
@@ -4400,10 +4404,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     }
     if (ip) {
     } else if (m > 8) {
-        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
+        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
         k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m); CUDA_TRACE_LAUNCH("k_idx_tail");
     } else{ 
-        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep"); }
+        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_prep"); }
     KCHK("k_idx_prep");
     if (m > MAXM) { k_possub<<<1, 32, 0, st_>>>(possub_, curpos_, (m + MAXM - 1) / MAXM); CUDA_TRACE_LAUNCH("k_possub"); }
     static const bool p2p = env_int("FLASH_XP2P", 1);
@@ -4428,7 +4432,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         // FLASH_ATTN_TC != 2, FLASH_ATTN_DEC=0, FLASH_DEC_NOPF; the branches below that read fp8 rows are not reached)
         CHECK(!kv4_ || !qsa_a_, "flash: 4-bit KV with FLASH_QSA_A (kv4_mode should have kept FP8)");
         if (qsa_a_) {
-            k_qsa_attn<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn");
+            k_qsa_attn<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_attn");
         } else {
             Xchg xq;
             // decode / verify rows, direct sends: host-memory slots when the decode collectives go through host memory
@@ -4507,11 +4511,11 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // fp32 path; FLASH_IDX_TILE=0 turns off both the tile and the tensor-core kernel (FLASH_IDX_TC then no-op)
                 static const bool itc = env_int("FLASH_IDX_TC", 1);
                 if (itc && pf_ && ist){ 
-                    k_idx_score_mma<<<dim3((lbmax + IT_BLK - 1) / IT_BLK, (mr + IT_ROWS - 1) / IT_ROWS), 256, IT_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score_mma"); }
+                    k_idx_score_mma<<<dim3((lbmax + IT_BLK - 1) / IT_BLK, (mr + IT_ROWS - 1) / IT_ROWS), 256, IT_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_score_mma"); }
                 else if (ist && mr > 8)  { // rows x blocks tiles: keys read once per 16 rows
-                    k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score_t"); }
+                    k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_score_t"); }
                 else{ 
-                k_idx_score<<<dim3((lbmax + 255) / 256, mr), 256, 0, st_>>>(L.ikb, iq, pp, p_, lbmax, iscore_, nullptr, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score"); }
+                k_idx_score<<<dim3((lbmax + 255) / 256, mr), 256, 0, st_>>>(L.ikb, iq, pp, p_, lbmax, iscore_, nullptr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_idx_score"); }
                 KCHK("k_idx_score");
                 const int ilt = idx_local_threads(mr);
                 if (idx_gk_) { k_idx_local<true><<<mr, ilt, 0, st_>>>(iscore_, pp, p_, lbmax, iloc_); CUDA_TRACE_LAUNCH("k_idx_local"); }
@@ -4576,7 +4580,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     tf<<<dim3(NQ / 2, (mr + 31) / 32, 1), 128, TB_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("tf");
                 } else{ 
                 k_qsa_attn_tc<<<dim3(NQ, (mr + TA_ROWS - 1) / TA_ROWS), 128, TA_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp,
-                                                                                            attn_x_, p_, xq, mr, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_tc"); }
+                                                                                            attn_x_, p_, xq, mr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_attn_tc"); }
             } else if (dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF"))) {
                 // decode / verify rows: GQA tile (12 heads of a kv head x 16-key tiles), keys split over S blocks per
                 // (kv head, row), with or without block selection
@@ -4694,14 +4698,14 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 d.o[0] = attn_x_;
                 for (int z = 1; z < attn_split_; z++) { d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                 (kv4_ ? k_qsa_attn_tc2<2, false, true> : k_qsa_attn_tc2<2>)<<<dim3(NQ / 2, (mr + 31) / 32, attn_split_), 128, TB_SMEM, st_>>>(
-                    qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, KvMap()); CUDA_TRACE_LAUNCH("k_qsa_attn_tc2"); }
+                    qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_attn_tc2"); }
                 k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, attn_split_); CUDA_TRACE_LAUNCH("k_attn_merge");
             } else if (rows_k && mr > 8)  { // many rows: one warp per row, rows of a block share K/V
                 k_qsa_attn_rows<<<dim3(NQ, (mr + 7) / 8), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, xq,
-                                                                          sel_on_ ? isel_ : nullptr, insel_, lbmax, mr, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_rows"); }
+                                                                          sel_on_ ? isel_ : nullptr, insel_, lbmax, mr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_attn_rows"); }
             else{ 
                 k_qsa_attn_b<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, xq,
-                                                             sel_on_ ? isel_ : nullptr, insel_, lbmax, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_b"); }
+                                                             sel_on_ ? isel_ : nullptr, insel_, lbmax, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_attn_b"); }
         }
         KCHK("k_qsa_attn");
         if (dh) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(attn_x_), (size_t)mr * NQ * (HD + 2), dh + 9); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
@@ -7183,7 +7187,8 @@ void Worker::prefill_multi(const PfSeg* sg, int nseg, const int* tokens, const b
         segn[j] = sg[j].n;
         n += sg[j].n;
         CHECK(sg[j].pos + sg[j].n <= max_ctx_, "flash: context %d > %d", sg[j].pos + sg[j].n, max_ctx_);
-        ctx_abs = std::max(ctx_abs, (long long)sg[j].base * p_.period + sg[j].pos + sg[j].n);
+        ctx_abs = std::max(ctx_abs,   live_period_d_ ? kv_top_
+                                         : (long long)sg[j].base * p_.period + sg[j].pos + sg[j].n);
     }
     CHECK(pf_multi_ok(segn.data(), nseg), "flash prefill_multi: layout of %d prompts, %d rows", nseg, n);
     // the bound slot's state and sampling parameters to its storage: every segment's state is read from its slot
@@ -8198,7 +8203,13 @@ void Worker::kv_host_release() {
 
 void Worker::kv_inval(int base, int t0, int t1) {
     if (!kvs_) return;
-    CUDA_CHECK(cudaSetDevice(dev_));
+    
+    
+  if (live_period_d_) {
+    live_inval(base, t0, t1);
+    return;
+  }
+  CUDA_CHECK(cudaSetDevice(dev_));
     const long long rb = (long long)base * p_.own;
     const int r0 = kv_rows(t0), r1 = kv_rows(t1);
     if (r1 <= r0) return;
@@ -8243,6 +8254,12 @@ void Worker::selwin_report() {
                 c[5] / ca, c[6] / ca, c[7] / ca, c[8] / ca, c[9] / ca, c[10] / ca, c[14] / ca, c[11] / ca);
     }
 }
+
+
+
+
+
+#include "live_prefix_worker.inc"
 
 }  // namespace flash
 
