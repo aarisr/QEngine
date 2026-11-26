@@ -441,7 +441,7 @@ void Worker::ple_b(Layer& L, int li, int m, int rps) {
     gemv_w4h(L.ple_val, pleh_, H, val, H, m, st_);
     float* gv = proj2_;
     float* gvn = yd_;
-    k_ple_gate<<<dim3(HC, m), 256, 0, st_>>>(key, val, R_, L.ple_nk, L.ple_nq, L.ple_nc, gv, gvn);
+    k_ple_gate<<<dim3(HC, m), 256, 0, st_>>>(key, val, R_, L.ple_nk, L.ple_nq, L.ple_nc, gv, gvn); CUDA_TRACE_LAUNCH("k_ple_gate");
     k_ple_conv_b<<<dim3(RW / 256, m / rps), 256, 0, st_>>>(gv, gvn, L.ple_conv, tab(TB_PH, li), tab(TB_PP, li), rslot_, bpn_, rps, R_);
     KCHK("k_ple_conv_b");
 }
@@ -454,21 +454,21 @@ void Worker::gdn_b(Layer& L, int li, int m, int rps) {
     gemv_w16(L.dn_ab, x_, H, proj2_, dn_ab_ld(vl), m, st_);
     float* cv = qbuf_;
     k_dn_conv_b<<<dim3((ch + 255) / 256, m / rps), 256, 0, st_>>>(proj_, ld, ch, L.conv_w, tab(TB_CH, li), tab(TB_CP, li), rslot_, bpn_,
-                                                                 rps, cv);
+                                                                 rps, cv); CUDA_TRACE_LAUNCH("k_dn_conv_b");
     float* o = gates_;
     static const int qkp = env_int("FLASH_DN_QK", 9);  // precomputed q / k norms from m rows (0: off)
     if (qkp > 0 && m >= qkp) {
-        k_dn_qk<<<dim3(m, kl + 1), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, dnqk_, dngb_);
+        k_dn_qk<<<dim3(m, kl + 1), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, dnqk_, dngb_); CUDA_TRACE_LAUNCH("k_dn_qk");
         k_dn_rec_bq<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, dnqk_, dngb_, tab(TB_S, li), tab(TB_RP, li),
-                                                            rslot_, bpn_, stepcs_, o, rps);
-    } else
+                                                            rslot_, bpn_, stepcs_, o, rps); CUDA_TRACE_LAUNCH("k_dn_rec_bq");
+    } else{ 
     k_dn_rec_b<<<dim3(vl, 16, m / rps), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, tab(TB_S, li), tab(TB_RP, li),
-                                                       rslot_, bpn_, stepcs_, o, rps);
+                                                       rslot_, bpn_, stepcs_, o, rps); CUDA_TRACE_LAUNCH("k_dn_rec_b"); }
     if (L.dn_out8.q) {
-        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_);
+        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_); CUDA_TRACE_LAUNCH("k_dn_out");
         gemv_w8_rows(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
     } else {
-    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV);
+    k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, ah_, vl * DV); CUDA_TRACE_LAUNCH("k_dn_out");
     gemv_w4h(L.dn_out, ah_, vl * DV, part_, H, m, st_);
     }
     KCHK("gdn_b");
@@ -483,7 +483,7 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, st_);
     const int nqp = ql, qh0 = p_.q0;
     (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(nqp + 4, m), 256, 0, st_>>>(proj_, ld, L.q_norm, L.k_norm, posd_, qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, p_, nqp,
-                                                   qh0, rp, rb, rs, kvmap(L));
+                                                   qh0, rp, rb, rs, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_prep");
     k_idx_prep_b<<<m / rps, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, rp, rb, rs, gates_, tab(TB_IT, li),
                                               kb.ikb, p_, rps);
     KCHK("qsa_b prep");
@@ -493,16 +493,16 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     xq.seq = xqseq_;
     xq.done = xqdone_;
     xq.scnt = xqscnt_;
-    if (p_.ngpu > 1) k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(qbuf_, m, xq, p_);
+    if (p_.ngpu > 1) { k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(qbuf_, m, xq, p_); CUDA_TRACE_LAUNCH("k_qxsend"); }
     Xchg xi;
     for (int g = 0; g < p_.ngpu; g++) { xi.recv[g] = xipr_[g]; xi.flags[g] = xipf_[g]; }
     xi.seq = xiseq_;
     xi.done = xidone_;
-    k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb);
+    k_idx_score<<<dim3((lbmax + 255) / 256, m), 256, 0, st_>>>(kb.ikb, gates_, posd_, p_, lbmax, iscore_, rp, rb); CUDA_TRACE_LAUNCH("k_idx_score");
     const int ilt = idx_local_threads(m);  // (1024 for <= 32 rows, as measured; 512 above)
-    if (idx_gk_) k_idx_local<true><<<m, ilt, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
-    else k_idx_local<<<m, ilt, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp);
-    if (p_.ngpu > 1) k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_);
+    if (idx_gk_) { k_idx_local<true><<<m, ilt, 0, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp); CUDA_TRACE_LAUNCH("k_idx_local"); }
+    else { k_idx_local<<<m, ilt, (size_t)lbmax * 4, st_>>>(iscore_, posd_, p_, lbmax, iloc_, rp); CUDA_TRACE_LAUNCH("k_idx_local"); }
+    if (p_.ngpu > 1) { k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, m, xi, p_); CUDA_TRACE_LAUNCH("k_idx_send"); }
     xpull(xi, 2, m, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
     k_idx_select<<<m, 1024, 0, st_>>>(iscore_, iloc_, posd_, p_, lbmax, xi, isel_, insel_, rp, idx_gk_, kvs_ ? L.kvp : KvPool(), rb,
                                       kvs_ && m <= MAXM ? psel_ : nullptr);
@@ -515,15 +515,15 @@ void Worker::qsa_b(Layer& L, int li, int m, const int* rp, const int* rb, const 
     const bool kv1 = qd_kv1_ == 1 && kv1_dec(m);  // [qfn-kv1-dec]
     auto qdf = kv4_ ? (kv1 ? k_qsa_dec<true, 0, true> : k_qsa_dec<false, 0, true>) : kv1 ? k_qsa_dec<true> : k_qsa_dec<false>;
     qdf<<<dim3(NKV, m, dec_split_), 128, kv1 ? QD_SMEM1 : QD_SMEM, st_>>>(qbuf_, kb.kc, kb.vc, kb.ks, kb.vs, posd_, d, p_, xq, isel_, insel_, lbmax,
-                                                               rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr, qd_mint(m, dec_split_));
-    if (dec_split_ > 1) k_attn_merge<<<dim3(NQ, m), HD, 0, st_>>>(d, dec_split_);
+                                                               rp, rb, false, kvmap(L), kvs_ && m <= MAXM ? psel_ : nullptr, qd_mint(m, dec_split_)); CUDA_TRACE_LAUNCH("qdf");
+    if (dec_split_ > 1) { k_attn_merge<<<dim3(NQ, m), HD, 0, st_>>>(d, dec_split_); CUDA_TRACE_LAUNCH("k_attn_merge"); }
     KCHK("qsa_b attn");
     Xchg xc;
     for (int g = 0; g < p_.ngpu; g++) { xc.recv[g] = xpr_[g]; xc.flags[g] = xpf_[g]; }
     xc.seq = xseq_;
     xc.done = xdone_;
     xc.scnt = xscnt_;
-    if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(attn_x_, m, xc, p_);
+    if (p_.ngpu > 1) { k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (m + 3) / 4)), 256, 0, st_>>>(attn_x_, m, xc, p_); CUDA_TRACE_LAUNCH("k_xsend"); }
     xpull(xc, 1, m, (size_t)xper(p_) * 4, xper(p_));
     k_qsa_comb2<<<dim3(ql, m), HD, 0, st_>>>(attn_x_, m, proj_, ld, ab_, ql * HD, xc, p_, nqp * HD, kv4_);
     KCHK("qsa_b comb");
@@ -558,8 +558,8 @@ void Worker::bdump(int li, int part, int m, int rps) {
 void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
     ll_idx_ = 0;
     curpos_ = posd_;
-    k_step_bump_b<<<1, 32, 0, st_>>>(stepcs_, bseg_d_, nseg);
-    if (p_.first()) k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_);
+    k_step_bump_b<<<1, 32, 0, st_>>>(stepcs_, bseg_d_, nseg); CUDA_TRACE_LAUNCH("k_step_bump_b");
+    if (p_.first()) { k_embed<<<m, 256, 0, st_>>>(embed_, toks, R_); CUDA_TRACE_LAUNCH("k_embed"); }
     else CUDA_CHECK(cudaMemcpyAsync(R_, pp_din_, (size_t)m * RW * 4, cudaMemcpyDeviceToDevice, st_));  // previous stage's rows
     for (int li = p_.l0; li < p_.l1; li++) {
         Layer& L = L_[li];
@@ -594,11 +594,11 @@ void Worker::trunk_b(int m, const int* toks, int nseg, int rps) {
 // MTP block over m rows (verify rows: chain = false, rows of the trunk; chain: one row per segment from Rminb_)
 void Worker::mtp_core_b(int m, bool chain, const int* toks, int* out, const int* rp, const int* rb, const int* rs, int rps) {
     const float* hsrc = chain ? Rminb_ : Rsave_;
-    k_mtp_prep<<<dim3(m, HC + 1), 256, 0, st_>>>(embed_, toks, hsrc, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_);
+    k_mtp_prep<<<dim3(m, HC + 1), 256, 0, st_>>>(embed_, toks, hsrc, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_); CUDA_TRACE_LAUNCH("k_mtp_prep");
     gemv_w8_rows(mtp_fce_, mtp_en_, H, mtp_fe_, H, m, st_);
     for (int r0 = 0; r0 < m * HC; r0 += kMaxBatchRows)
         gemv_w8(mtp_fch_, mtp_hn_ + (size_t)r0 * H, H, mtp_fh_ + (size_t)r0 * H, H, std::min(kMaxBatchRows, m * HC - r0), st_);
-    k_mtp_comb<<<m, 512, 0, st_>>>(mtp_fe_, mtp_fh_, Rm_);
+    k_mtp_comb<<<m, 512, 0, st_>>>(mtp_fe_, mtp_fh_, Rm_); CUDA_TRACE_LAUNCH("k_mtp_comb");
     float* Rt = R_;
     float* Rt2 = R2_;
     R_ = Rm_;
@@ -610,7 +610,7 @@ void Worker::mtp_core_b(int m, bool chain, const int* toks, int* out, const int*
     moe(mtp_, m);
     hc_write(m);
     flush_y(m);
-    k_copy_rows_b<<<dim3(RW / 512, chain ? m : m / rps), 512, 0, st_>>>(Rminb_, R_, chain ? nullptr : bacc_);
+    k_copy_rows_b<<<dim3(RW / 512, chain ? m : m / rps), 512, 0, st_>>>(Rminb_, R_, chain ? nullptr : bacc_); CUDA_TRACE_LAUNCH("k_copy_rows_b");
     hc_read(mtp_mixer_, m, false);
     R_ = Rt;
     R2_ = Rt2;
@@ -623,38 +623,38 @@ void Worker::batch_body(int nseg, int k) {
     CUDA_CHECK(cudaMemcpyAsync(bseg_d_, bseg_h_, (size_t)2 * MAXM * 4, cudaMemcpyHostToDevice, st_));
     CUDA_CHECK(cudaMemcpyAsync(kvrb_d_, kvrb_h_, slots_.size() * 4, cudaMemcpyHostToDevice, st_));
     comm_begin_unit(ctr_, st_);
-    k_bmeta<<<1, 32, 0, st_>>>(bseg_d_, nseg, rps, svp_, svt_, kvrb_d_, rpos_, rbase_, rslot_, bvt_, bpn_);
+    k_bmeta<<<1, 32, 0, st_>>>(bseg_d_, nseg, rps, svp_, svt_, kvrb_d_, rpos_, rbase_, rslot_, bvt_, bpn_); CUDA_TRACE_LAUNCH("k_bmeta");
     if (!layer_here(PLE_LAYER)) {
         // pipeline stage without the n-gram embedding layer: no rows needed
     } else if (ngp_.flags) {  // staged rows (table not pinned): ids -> host -> rows
         NgramDev g = ngp_;
         g.phase = 1;
-        k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, g, pler_);
-        k_ngram_handoff<<<1, 32, 0, st_>>>(g, m * PLE_HEADS);
+        k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, g, pler_); CUDA_TRACE_LAUNCH("k_ngram_b");
+        k_ngram_handoff<<<1, 32, 0, st_>>>(g, m * PLE_HEADS); CUDA_TRACE_LAUNCH("k_ngram_handoff");
         g.phase = 2;
-        k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, g, pler_);
-    } else
-    k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, ngp_, pler_);
+        k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, g, pler_); CUDA_TRACE_LAUNCH("k_ngram_b");
+    } else{ 
+    k_ngram_b<<<m, 256, 0, st_>>>(bvt_, rslot_, rps, svh_, ngp_, pler_); CUDA_TRACE_LAUNCH("k_ngram_b"); }
     KCHK("batch meta");
     trunk_b(m, bvt_, nseg, rps);
     // pipeline stages before the last: their layers only; the last stage accepts, drafts and advances the per-slot
     // speculative state, which the driver copies to the other stages before their next step (spec_state_get / _set)
     if (!p_.last()) { KCHK("batch step (stage)"); return; }
-    k_accept_b<<<1, 32, 0, st_>>>(bvt_, otok_, k, nseg, bseg_d_, bseg_d_ + MAXM, svp_, svh_, bacc_, bem_);
+    k_accept_b<<<1, 32, 0, st_>>>(bvt_, otok_, k, nseg, bseg_d_, bseg_d_ + MAXM, svp_, svh_, bacc_, bem_); CUDA_TRACE_LAUNCH("k_accept_b");
     if (bsamp_) pen_commit_b(spslot_, bseg_d_, nseg, bem_, MAXM + 2, svp_, st_);
     if (has_mtp_) {
         mtp_core_b(m, false, otok_, motok_, rpos_, rbase_, rslot_, rps);
-        k_draft0_b<<<1, 32, 0, st_>>>(motok_, bacc_, bdr_, nseg);
+        k_draft0_b<<<1, 32, 0, st_>>>(motok_, bacc_, bdr_, nseg); CUDA_TRACE_LAUNCH("k_draft0_b");
         for (int j = 1; j < k; j++) {
-            k_bmeta_chain<<<1, 32, 0, st_>>>(bseg_d_, nseg, svp_, kvrb_d_, j, chpos_, chbase_);
+            k_bmeta_chain<<<1, 32, 0, st_>>>(bseg_d_, nseg, svp_, kvrb_d_, j, chpos_, chbase_); CUDA_TRACE_LAUNCH("k_bmeta_chain");
             mtp_core_b(nseg, true, bdr_ + (size_t)(j - 1) * MAXM, bdr_ + (size_t)j * MAXM, chpos_, chbase_, bseg_d_, 1);
         }
     }
-    k_next_b<<<1, 32, 0, st_>>>(svt_, otok_, bacc_, bdr_, has_mtp_ ? k : 0, nseg, bseg_d_);
+    k_next_b<<<1, 32, 0, st_>>>(svt_, otok_, bacc_, bdr_, has_mtp_ ? k : 0, nseg, bseg_d_); CUDA_TRACE_LAUNCH("k_next_b");
     if (blk_ && k > 0) {  // lookup drafts replace the MTP drafts of segments whose history repeats
         const size_t hs = (size_t)max_ctx_ + 64;
-        k_hist_add_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, bem_);
-        k_lk_scan_b<<<dim3((unsigned)((hs + 255) / 256), nseg), 256, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, lkbb_);
+        k_hist_add_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, bem_); CUDA_TRACE_LAUNCH("k_hist_add_b");
+        k_lk_scan_b<<<dim3((unsigned)((hs + 255) / 256), nseg), 256, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, lkbb_); CUDA_TRACE_LAUNCH("k_lk_scan_b");
         k_lk_pick_b<<<1, 32, 0, st_>>>(hdb_, hnb_, hs, bseg_d_, nseg, k, blk_min_, lkbb_, svt_, blkcnt_, nolk_d_);
         KCHK("batch lookup");
     }

@@ -1260,6 +1260,7 @@ void PpXfer::cp(size_t r, int s, void* tpp, const void* stp_c, size_t bytes, int
     const int ddev = dir ? sd : td, sdev = dir ? td : sd;
     cudaError_t e = ddev == sdev ? cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, st)
                                  : cudaMemcpyPeerAsync(dst, ddev, src, sdev, bytes, st);
+    CUDA_TRACE_OP(e, ddev == sdev ? "cudaMemcpyAsync(PpXfer::cp)" : "cudaMemcpyPeerAsync(PpXfer::cp)");
     CHECK(e == cudaSuccess, "flash: PP transfer copy %s (layer %d, TP rank %zu, stage %d, dir %d): %s; %zu bytes", what_, what_li_, r, s, dir,
           cudaGetErrorString(e), bytes);
     moved_ += bytes;
@@ -1286,6 +1287,7 @@ void PpXfer::cp2d(size_t r, int s, char* tpp, size_t tpitch, const char* stp, si
         pm.extent = make_cudaExtent(width, height, 1);
         e = cudaMemcpy3DPeerAsync(&pm, st);
     }
+    CUDA_TRACE_OP(e, ddev == sdev ? "cudaMemcpy2DAsync(PpXfer::cp2d)" : "cudaMemcpy3DPeerAsync(PpXfer::cp2d)");
     CHECK(e == cudaSuccess, "flash: PP transfer strided copy %s (layer %d, TP rank %zu, stage %d, dir %d): %s", what_, what_li_, r, s, dir,
           cudaGetErrorString(e));
     moved_ += width * height;

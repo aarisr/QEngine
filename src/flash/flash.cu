@@ -293,10 +293,10 @@ char* pin_host(const void* src, size_t n, int threads, bool chunked, const std::
 #define NT_LAUNCH(m, KERNEL, GRID, BLOCK, ...)                                                    \
     do {                                                                                          \
         const int nt_ = ((m) + 7) / 8;                                                            \
-        if (nt_ == 1) KERNEL<1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                            \
-        else if (nt_ == 2) KERNEL<2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                       \
-        else if (nt_ == 3) KERNEL<3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                       \
-        else KERNEL<4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__);                                     \
+        if (nt_ == 1) { KERNEL<1><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__); CUDA_TRACE_LAUNCH("KERNEL"); }                            \
+        else if (nt_ == 2) { KERNEL<2><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__); CUDA_TRACE_LAUNCH("KERNEL"); }                       \
+        else if (nt_ == 3) { KERNEL<3><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__); CUDA_TRACE_LAUNCH("KERNEL"); }                       \
+        else { KERNEL<4><<<GRID, BLOCK, 0, st_>>>(__VA_ARGS__); CUDA_TRACE_LAUNCH("KERNEL"); }                                     \
     } while (0)
 // decode attention: key tiles per used split (FLASH_ATTN_DMIN; 0: always all dec_split_ splits). Only for launches of
 // more than one wave (NKV x rows x splits blocks > 2 per SM: batched steps, lookup steps): there the unused splits of
@@ -337,13 +337,13 @@ static void gemv_w16_rows(const W16& w, const bf16* x, int ldx, float* y, int ld
                           size_t ystride = 0) {
     if (g_rows_min > 0 && m >= g_rows_min && ksplit == 1) {
         if (g_rows_gemm && w.n % 64 == 0 && w.k % 128 == 0 && ldx % 8 == 0) {
-            k_rows_gemm<false><<<dim3(w.n / 64, (m + 31) / 32), 128, 0, st>>>(w.w, nullptr, w.k, w.n, x, ldx, y, ldy, m);
+            k_rows_gemm<false><<<dim3(w.n / 64, (m + 31) / 32), 128, 0, st>>>(w.w, nullptr, w.k, w.n, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemm");
             return;
         }
-        if (w.n / 16 < 8)  // few tiles (DeltaNet a/b: 2): 8-row groups, 8 warps over K
-            k_rows_gemv<false, 1, 8><<<dim3(w.n / 16, (m + 7) / 8), 256, 0, st>>>(w.w, nullptr, w.k, x, ldx, y, ldy, m);
-        else
-            k_rows_gemv<false><<<dim3(w.n / 16, (m + 31) / 32), 128, 0, st>>>(w.w, nullptr, w.k, x, ldx, y, ldy, m);
+        if (w.n / 16 < 8)  { // few tiles (DeltaNet a/b: 2): 8-row groups, 8 warps over K
+            k_rows_gemv<false, 1, 8><<<dim3(w.n / 16, (m + 7) / 8), 256, 0, st>>>(w.w, nullptr, w.k, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemv"); }
+        else{ 
+            k_rows_gemv<false><<<dim3(w.n / 16, (m + 31) / 32), 128, 0, st>>>(w.w, nullptr, w.k, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemv"); }
         return;
     }
     for (int r0 = 0; r0 < m; r0 += kMaxBatchRows)
@@ -353,13 +353,13 @@ static void gemv_w16_rows(const W16& w, const bf16* x, int ldx, float* y, int ld
 static void gemv_w8_rows(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m, cudaStream_t st) {
     if (g_rows_min > 0 && m >= g_rows_min) {
         if (g_rows_gemm && w.n % 16 == 0 && w.n >= 256 && w.k % 128 == 0 && ldx % 8 == 0) {
-            if (w.n >= 4096)  // wide (QSA qkv): 64-row blocks halve the weight re-reads
-                k_rows_gemm<true, 64><<<dim3((w.n + 63) / 64, (m + 63) / 64), 128, 0, st>>>(w.q, w.s, w.k, w.n, x, ldx, y, ldy, m);
-            else
-                k_rows_gemm<true><<<dim3((w.n + 63) / 64, (m + 31) / 32), 128, 0, st>>>(w.q, w.s, w.k, w.n, x, ldx, y, ldy, m);
+            if (w.n >= 4096)  { // wide (QSA qkv): 64-row blocks halve the weight re-reads
+                k_rows_gemm<true, 64><<<dim3((w.n + 63) / 64, (m + 63) / 64), 128, 0, st>>>(w.q, w.s, w.k, w.n, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemm"); }
+            else{ 
+                k_rows_gemm<true><<<dim3((w.n + 63) / 64, (m + 31) / 32), 128, 0, st>>>(w.q, w.s, w.k, w.n, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemm"); }
             return;
         }
-        k_rows_gemv<true><<<dim3(w.n / 16, (m + 31) / 32), 128, 0, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m);
+        k_rows_gemv<true><<<dim3(w.n / 16, (m + 31) / 32), 128, 0, st>>>(w.q, w.s, w.k, x, ldx, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_gemv");
         return;
     }
     for (int r0 = 0; r0 < m; r0 += kMaxBatchRows)
@@ -384,7 +384,7 @@ void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m
     int8_t* xq = reinterpret_cast<int8_t*>(pfact_);
     float2* xs = reinterpret_cast<float2*>(xq + (size_t)m * w.k);
     lend_use(xq, need, "row GEMM workspace (pfact_)");
-    k_x_to_r8<<<m, w.k / 16, 0, st>>>(x, ldx, w.k, xq, xs);
+    k_x_to_r8<<<m, w.k / 16, 0, st>>>(x, ldx, w.k, xq, xs); CUDA_TRACE_LAUNCH("k_x_to_r8");
     // weight-block width ([fp-rq]): TA weight tiles per warp (32 TA rows per block, one block per SM). Model: waves x
     // wave time, a wave of TA-blocks ~ TA + 0.75 units (fit 5504 x 2560, 512 rows: 42.9 / 35.5 / 25.0 us per wave for
     // TA 4 / 3 / 2). A narrower block only when the model gains >= 5 % and m >= 128 (m < 128 is slower for every TA,
@@ -405,12 +405,12 @@ void Worker::rows8(const W8& w, const bf16* x, int ldx, float* y, int ldy, int m
                 if (cost(t) * 100 <= c4 * 95 && cost(t) < best) { best = cost(t); ta = t; }
     }
     const dim3 grid(tb, (w.n + 32 * ta - 1) / (32 * ta));
-    if (ta == 4) k_rows_qt<4><<<grid, 256, rq_smem<4>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m);
-    else if (ta == 3) k_rows_qt<3><<<grid, 256, rq_smem<3>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m);
-    else k_rows_qt<2><<<grid, 256, rq_smem<2>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m);
+    if (ta == 4) { k_rows_qt<4><<<grid, 256, rq_smem<4>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_qt"); }
+    else if (ta == 3) { k_rows_qt<3><<<grid, 256, rq_smem<3>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_qt"); }
+    else { k_rows_qt<2><<<grid, 256, rq_smem<2>(), st>>>(w.q, w.s, w.k, w.n, xq, xs, y, ldy, m); CUDA_TRACE_LAUNCH("k_rows_qt"); }
 }
 static const bool g_kchk = env_int("FLASH_KCHK", 0);
-#define KCHK(name) do { if (g_kchk) { cudaError_t e_ = cudaDeviceSynchronize(); if (e_ != cudaSuccess) { fprintf(stderr, "kernel %s: %s\n", name, cudaGetErrorString(e_)); exit(1); } } } while (0)
+#define KCHK(name) do { if (g_kchk) { cudaError_t e_ = cudaDeviceSynchronize(); if (e_ != cudaSuccess) { fprintf(stderr, "kernel %s: %s\n", name, cudaGetErrorString(e_)); exit(1); } } else { CUDA_TRACE_LAUNCH(name); } } while (0)
 
 // Several workers whose kernels wait on each other on one card (TP ranks sharing a card: a TP4 test on 3 cards,
 // devices 0,1,2,2): a spin-waiting kernel of one rank can hold every SM while the peer rank's producer kernel waits for
@@ -792,8 +792,8 @@ unsigned long long Worker::checksum(int first, int last) {
     unsigned long long* d;
     CUDA_CHECK(cudaMalloc(&d, 8));
     CUDA_CHECK(cudaMemset(d, 0, 8));
-    for (int i = first; i < last && i < (int)allocs_.size(); i++)
-        k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d);
+    for (int i = first; i < last && i < (int)allocs_.size(); i++){ 
+        k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d); CUDA_TRACE_LAUNCH("k_csum"); }
     unsigned long long h;
     CUDA_CHECK(cudaMemcpyAsync(&h, d, 8, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -3648,7 +3648,7 @@ void Worker::ec_tick(int ctx_end, int kind) {
         CUDA_CHECK(cudaStreamWaitEvent(ec_cs_, ec_evt_, 0));
         // FLASH_EC_DELAY=ns: stress test, the copies land late (slot reclaim / pointer switch vs in-flight copies)
         static const unsigned delay = (unsigned)env_int("FLASH_EC_DELAY", 0u);
-        if (delay) k_spin<<<1, 1, 0, ec_cs_>>>(delay);
+        if (delay) { k_spin<<<1, 1, 0, ec_cs_>>>(delay); CUDA_TRACE_LAUNCH("k_spin"); }
         for (auto& [s2, ci] : copies) {
             CUDA_CHECK(cudaMemcpyAsync(ec_slots_[s2].addr, ec_src_[ci], GRP_BYTES, cold_kind(), ec_cs_));
             CUDA_CHECK(cudaEventRecord(ec_slots_[s2].ev, ec_cs_));
@@ -3782,8 +3782,8 @@ int Worker::ec_verify(const char* where) {
     if (it.empty()) return 0;
     if (!ec_vsum_d_) ec_vsum_d_ = (unsigned long long*)dalloc((ec_slots_.size() + 2 * (size_t)std::max(1, pfs_cap_)) * 8);
     CUDA_CHECK(cudaMemsetAsync(ec_vsum_d_, 0, it.size() * 8, st_));  // (all on st_: a non-blocking stream)
-    for (size_t k = 0; k < it.size(); k++)
-        k_csum<<<64, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(it[k].dev), GRP_BYTES / 4, ec_vsum_d_ + k);
+    for (size_t k = 0; k < it.size(); k++){ 
+        k_csum<<<64, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(it[k].dev), GRP_BYTES / 4, ec_vsum_d_ + k); CUDA_TRACE_LAUNCH("k_csum"); }
     std::vector<unsigned long long> d(it.size());
     CUDA_CHECK(cudaMemcpyAsync(d.data(), ec_vsum_d_, it.size() * 8, cudaMemcpyDeviceToHost, st_));
     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -3850,7 +3850,7 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
         if (maxdev) {
             unsigned long long* d;
             CUDA_CHECK(cudaMalloc(&d, (size_t)maxdev * 8));
-            k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d);
+            k_gsum<<<maxdev, 256, 0, st_>>>(reinterpret_cast<const uint32_t*>(L.groups), d); CUDA_TRACE_LAUNCH("k_gsum");
             CUDA_CHECK(cudaMemcpyAsync(dsum.data(), d, (size_t)maxdev * 8, cudaMemcpyDeviceToHost, st_));
             CUDA_CHECK(cudaStreamSynchronize(st_));
             CUDA_CHECK(cudaFree(d));
@@ -3887,14 +3887,14 @@ void Worker::gsum(int nw, unsigned long long* experts, unsigned long long* other
                 unsigned long long* d1;
                 CUDA_CHECK(cudaMalloc(&d1, 8));
                 CUDA_CHECK(cudaMemsetAsync(d1, 0, 8, st_));
-                k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d1);
+                k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d1); CUDA_TRACE_LAUNCH("k_csum");
                 unsigned long long v;
                 CUDA_CHECK(cudaMemcpyAsync(&v, d1, 8, cudaMemcpyDeviceToHost, st_));
                 CUDA_CHECK(cudaStreamSynchronize(st_));
                 CUDA_CHECK(cudaFree(d1));
                 fprintf(fa, "%d %zu %016llx\n", i, allocs_[i].second, v);
             }
-            k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d);
+            k_csum<<<256, 256, 0, st_>>>((const uint32_t*)allocs_[i].first, allocs_[i].second / 4, d); CUDA_TRACE_LAUNCH("k_csum");
         }
         if (fa) fclose(fa);
         CUDA_CHECK(cudaMemcpyAsync(&ot, d, 8, cudaMemcpyDeviceToHost, st_));
@@ -4038,8 +4038,8 @@ SteerArg Worker::steer_arg(int li, const int* rslot) const {
 }
 
 void Worker::steer(int li, int m, const int* rslot, cudaStream_t s, float* R, const float* inj, float* y) {
-    if (!steer_w_ || li < steer_lo_ || li > steer_hi_ || m <= 0) return;
-    k_steer<<<m, STEER_T, 0, s>>>(R, inj, y, steer_arg(li, rslot));
+    if (!steer_w_ || li < steer_lo_ || li > steer_hi_ || m <= 0) { return;
+    k_steer<<<m, STEER_T, 0, s>>>(R, inj, y, steer_arg(li, rslot)); CUDA_TRACE_LAUNCH("k_steer"); }
     KCHK("k_steer");
 }
 
@@ -4067,8 +4067,8 @@ void Worker::steer_flush(int m) {
 // ---------------------------------------------------------------- forward pieces
 void Worker::flush_y(int m) {  // apply a pending residual update (R_i += inj_i * y) explicitly
     steer_flush(m);  // a pending layer-output steering first (it applies the update of its rows itself)
-    if (!ypend_) return;
-    k_hc_write<<<m, 512, 0, st_>>>(R_, inj_, y_);
+    if (!ypend_) { return;
+    k_hc_write<<<m, 512, 0, st_>>>(R_, inj_, y_); CUDA_TRACE_LAUNCH("k_hc_write"); }
     KCHK("k_hc_write");
     ypend_ = false;
 }
@@ -4083,8 +4083,8 @@ static void hcd_pf2(const HcW& w, const float* R, float* u, int m, float* ss, un
         if (v != 2 && v != 4) fprintf(stderr, "[flash] FLASH_HCD_KS=%d: only 2 (default) or 4 (old split); using 2\n", v);
         return v == 4 ? 4 : 2;
     }();
-    if (ksn == 4 || fu) k_hcd_pf2<1><<<dim3(3, HC * 4, (m + 31) / 32), 224, 0, s>>>(w.fd.q, w.fd.s, R, u, m, ss, fu, fs);
-    else k_hcd_pf2<2><<<dim3(3, HC * 2, (m + 31) / 32), 224, 0, s>>>(w.fd.q, w.fd.s, R, u, m, ss, fu, fs);
+    if (ksn == 4 || fu) { k_hcd_pf2<1><<<dim3(3, HC * 4, (m + 31) / 32), 224, 0, s>>>(w.fd.q, w.fd.s, R, u, m, ss, fu, fs); CUDA_TRACE_LAUNCH("k_hcd_pf2"); }
+    else { k_hcd_pf2<2><<<dim3(3, HC * 2, (m + 31) / 32), 224, 0, s>>>(w.fd.q, w.fd.s, R, u, m, ss, fu, fs); CUDA_TRACE_LAUNCH("k_hcd_pf2"); }
 }
 
 // [qfn-tailpf] the next dense op's weights for the tail prefetch of the kernel before it (k_hcu / k_dn_out), single-sequence
@@ -4129,14 +4129,14 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
                 unsigned long long* fu = detpart_;
                 unsigned long long* fs = detpart_ + (size_t)m * HC * HCD_ROWS;
                 hcd_pf2(w, R_, hu_, m, hss_, fu, fs, st_);
-                k_fx_to_f<<<256, 256, 0, st_>>>(fu, hu_, (size_t)m * HC * HCD_ROWS);
-                k_fx_to_f<<<64, 256, 0, st_>>>(fs, hss_, (size_t)m * HC);
+                k_fx_to_f<<<256, 256, 0, st_>>>(fu, hu_, (size_t)m * HC * HCD_ROWS); CUDA_TRACE_LAUNCH("k_fx_to_f");
+                k_fx_to_f<<<64, 256, 0, st_>>>(fs, hss_, (size_t)m * HC); CUDA_TRACE_LAUNCH("k_fx_to_f");
             } else {
             CUDA_CHECK(cudaMemsetAsync(hu_, 0, (size_t)m * HC * HCD_ROWS * 4, st_));
             CUDA_CHECK(cudaMemsetAsync(hss_, 0, (size_t)m * HC * 4, st_));
             hcd_pf2(w, R_, hu_, m, hss_, nullptr, nullptr, st_);  // + sums of squares
             }
-            k_hc_mid_pf<<<m, 352, 0, st_>>>(hu_, hss_, hh_pf_, rinv_pf_, inject ? inj_ : nullptr);
+            k_hc_mid_pf<<<m, 352, 0, st_>>>(hu_, hss_, hh_pf_, rinv_pf_, inject ? inj_ : nullptr); CUDA_TRACE_LAUNCH("k_hc_mid_pf");
             static const int hy = env_int("FLASH_HCU_Y", 1);  // blocks over 32-row groups (1: each block loops, cp.async one group ahead)
             k_hcu_pf2<<<dim3((HCU_TILES + 7) / 8, std::max(1, std::min(hy, (m + 31) / 32))), 256, 0, st_>>>(w.uq, w.us, hh_pf_, rinv_pf_, R_, w.norm, x_, xh_, m);
             KCHK("hc pf2");
@@ -4163,7 +4163,7 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
                 prefetch_l2(w.uq, (size_t)HCU_TILES * (HCU_KS / 2) * 32 * 16, pfs_);
                 CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
             }
-            k_hc_mid_dec<<<m, 512, 0, st_>>>(hcp_, R_, hh_pf_, rinv_pf_, inject ? inj_ : nullptr, yp, inj_, sfa);
+            k_hc_mid_dec<<<m, 512, 0, st_>>>(hcp_, R_, hh_pf_, rinv_pf_, inject ? inj_ : nullptr, yp, inj_, sfa); CUDA_TRACE_LAUNCH("k_hc_mid_dec");
             if (l2u) CUDA_CHECK(cudaStreamWaitEvent(st_, pfe1_, 0));
             ypend_ = false;
             KCHK("k_hcd_s");
@@ -4188,12 +4188,12 @@ void Worker::hc_read(const HcW& w, int m, bool inject) {
     k_hc_norm<<<dim3(HC, m), 256, 0, st_>>>(R_, w.norm, hn_);
     KCHK("k_hc_norm");
     if (w.down16.w) gemv_w16(w.down16, hn_, RW, z_, HCD_ROWS, m, st_);
-    else gemv_w8(w.down, hn_, RW, z_, HCD_ROWS, m, st_);
-    k_hc_mid<<<m, 384, 0, st_>>>(z_, zb_, inj_, m);
+    else { gemv_w8(w.down, hn_, RW, z_, HCD_ROWS, m, st_);
+    k_hc_mid<<<m, 384, 0, st_>>>(z_, zb_, inj_, m); CUDA_TRACE_LAUNCH("k_hc_mid"); }
     KCHK("k_hc_mid");
     if (w.up16.w) gemv_w16(w.up16, zb_, HCU_K, gates_, RW, m, st_);
-    else gemv_w8(w.up, zb_, HCU_K, gates_, RW, m, st_);
-    k_hc_mix<<<m, 512, 0, st_>>>(gates_, hn_, x_, xh_);
+    else { gemv_w8(w.up, zb_, HCU_K, gates_, RW, m, st_);
+    k_hc_mix<<<m, 512, 0, st_>>>(gates_, hn_, x_, xh_); CUDA_TRACE_LAUNCH("k_hc_mix"); }
     KCHK("k_hc_mix");
     (void)inject;
 }
@@ -4238,11 +4238,11 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
         float* cv = qbuf_;
         if (m >= 16) {  // rows in parallel, then the new history
             k_dn_conv_par<<<dim3((ch + 255) / 256, (m + 15) / 16), 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend,
-                                                                             posd_ + 1, cv, m);
+                                                                             posd_ + 1, cv, m); CUDA_TRACE_LAUNCH("k_dn_conv_par");
             k_dn_conv_hist<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_hist, L.conv_pend, posd_ + 1, m);
             KCHK("dn pf conv");
-        } else
-        k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m, true);
+        } else{ 
+        k_dn_conv_d<<<(ch + 255) / 256, 256, 0, st_>>>(proj_, ld, ch, L.conv_w, L.conv_hist, L.conv_pend, posd_ + 1, cv, m, true); CUDA_TRACE_LAUNCH("k_dn_conv_d"); }
         float* o = gates_;
         static const int cmin = env_int("FLASH_DN_CHUNK", 64);  // 0: sequential
         if (cmin > 0 && m >= cmin) {  // chunked (WY) delta rule on tensor cores (dn_chunk.cu of the 27B engine)
@@ -4264,9 +4264,9 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
             KCHK("dn pf qk");
             ::dn_core_chunked(cv, ch, s, dnqk_, dngb_, L.S, 0, zero_d_, m, o, st_, 0);
             KCHK("dn pf core");
-        } else
+        } else{ 
         k_dn_rec_d<<<dim3(vl, 16), 128, 0, st_>>>(cv, ch, kl, vl, p_.k0, p_.v0, proj2_, L.A, L.dtb, L.S, L.rec_pend,
-                                                   posd_ + 1, stepc_, o, m, true);
+                                                   posd_ + 1, stepc_, o, m, true); CUDA_TRACE_LAUNCH("k_dn_rec_d"); }
         k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_);
         KCHK("dn pf");
         if (L.dn_out8.q) rows8(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
@@ -4294,7 +4294,7 @@ void Worker::gdn(Layer& L, int li, int pos, int m) {
     KCHK("k_dn_rec_d");
     if (L.dn_out8.q) {
         tail_pf(L.dn_out8, m);  // [qfn-tailpf] the out_proj weights, from k_dn_out's tail
-        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_, tpf_p_, tpf_b_);
+        k_dn_out<<<dim3(vl, m), 128, 0, st_>>>(o, proj_ + ch, ld, L.dn_norm, vl, nullptr, vl * DV, ab_, tpf_p_, tpf_b_); CUDA_TRACE_LAUNCH("k_dn_out");
         tpf_p_ = nullptr; tpf_b_ = 0;
         KCHK("k_dn_out");
         gemv_w8_rows(L.dn_out8, ab_, vl * DV, part_, H, m, st_);
@@ -4351,10 +4351,10 @@ void Worker::qsa_kv(Layer& L, int m) {
                                                    nqp, qh0, nullptr, rbcur_, nullptr, kvmap(L));
     KCHK("k_qsa_prep (kv only)");
     if (m > 8) {
-        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_);
-        k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m);
-    } else
-        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_);
+        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
+        k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m); CUDA_TRACE_LAUNCH("k_idx_tail");
+    } else{ 
+        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep"); }
     KCHK("k_idx_prep (kv only)");
 }
 
@@ -4380,7 +4380,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         CUDA_CHECK(cudaEventRecord(pfe0_, st_));
         CUDA_CHECK(cudaStreamWaitEvent(pfs_, pfe0_, 0));
         gemv_w16_rows(L.idx, x_, H, proj2_, (IDX_NH + 1) * IDX_HD, m, ist);
-        k_idx_prep<<<1, IDX_HD, 0, ist>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_);
+        k_idx_prep<<<1, IDX_HD, 0, ist>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep");
         CUDA_CHECK(cudaEventRecord(pfe1_, pfs_));
     }
     bool ijoined = !ip;
@@ -4393,19 +4393,19 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
     KCHK("k_qsa_prep");
     unsigned long long* dh = (dbgh_ && pf_ && li >= 0 && li < LAYERS) ? dbgh_ + li * DBGK : nullptr;
     if (dh) {
-        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(x_), (size_t)m * H / 2, dh + 4);
-        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(proj_), (size_t)m * ld, dh + 5);
-        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(proj2_), (size_t)m * (IDX_NH + 1) * IDX_HD, dh + 6);
-        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(qbuf_), (size_t)m * (NQ + 4) * HD, dh + 7);
+        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(x_), (size_t)m * H / 2, dh + 4); CUDA_TRACE_LAUNCH("k_dbg_hash");
+        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(proj_), (size_t)m * ld, dh + 5); CUDA_TRACE_LAUNCH("k_dbg_hash");
+        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(proj2_), (size_t)m * (IDX_NH + 1) * IDX_HD, dh + 6); CUDA_TRACE_LAUNCH("k_dbg_hash");
+        k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(qbuf_), (size_t)m * (NQ + 4) * HD, dh + 7); CUDA_TRACE_LAUNCH("k_dbg_hash");
     }
     if (ip) {
     } else if (m > 8) {
-        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_);
-        k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m);
-    } else
-        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_);
+        k_idx_prep_rows<<<m, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep_rows");
+        k_idx_tail<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, curpos_, L.ik_tail, m); CUDA_TRACE_LAUNCH("k_idx_tail");
+    } else{ 
+        k_idx_prep<<<1, IDX_HD, 0, st_>>>(proj2_, (IDX_NH + 1) * IDX_HD, L.iq_norm, L.ik_norm, curpos_, gates_, L.ik_tail, L.ikb, p_, m, rbcur_); CUDA_TRACE_LAUNCH("k_idx_prep"); }
     KCHK("k_idx_prep");
-    if (m > MAXM) k_possub<<<1, 32, 0, st_>>>(possub_, curpos_, (m + MAXM - 1) / MAXM);
+    if (m > MAXM) { k_possub<<<1, 32, 0, st_>>>(possub_, curpos_, (m + MAXM - 1) / MAXM); CUDA_TRACE_LAUNCH("k_possub"); }
     static const bool p2p = env_int("FLASH_XP2P", 1);
     const int lbmax = srows_ / IDX_R;
     // attention over the chunk at once; with block selection in sub-chunks of MAXM rows (its buffers are MAXM rows)
@@ -4428,7 +4428,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
         // FLASH_ATTN_TC != 2, FLASH_ATTN_DEC=0, FLASH_DEC_NOPF; the branches below that read fp8 rows are not reached)
         CHECK(!kv4_ || !qsa_a_, "flash: 4-bit KV with FLASH_QSA_A (kv4_mode should have kept FP8)");
         if (qsa_a_) {
-            k_qsa_attn<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, rbcur_);
+            k_qsa_attn<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn");
         } else {
             Xchg xq;
             // decode / verify rows, direct sends: host-memory slots when the decode collectives go through host memory
@@ -4445,7 +4445,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 static int sr = -1, sns = 0, sph = 0;
                 static bool init = false;
                 if (!init) { init = true; if (const char* e = env_str("FLASH_SPIN_RANK")) sscanf(e, "%d,%d,%d", &sr, &sns, &sph); }
-                if (sr == p_.rank && sns > 0) k_spin<<<1, 1, 0, st_>>>(sns);
+                if (sr == p_.rank && sns > 0) { k_spin<<<1, 1, 0, st_>>>(sns); CUDA_TRACE_LAUNCH("k_spin"); }
             }
             // block selection reads q in k_qsa_dec, which takes the peers' rows as fp16 too (x16o)
             // decode / MTP rows (mr <= 8, always k_qsa_dec): the peers' q as fp16 too (FLASH_QX16_DEC, default 1): k_qsa_dec
@@ -4476,17 +4476,17 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 const int nqx = (NQ - ql) * HD;
                 rows8(L.qx, x_, H, qxb_, nqx, m, st_);
                 for (int g = 0, j = 0; g < p_.ngpu; g++)
-                    if (g != p_.rank)
+                    if (g != p_.rank){ 
                         (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(QPC(p_), m), 256, 0, st_>>>(qxb_ + (size_t)(j++) * QPC(p_) * HD, nqx, L.q_norm, L.k_norm, curpos_,
                                                                      qbuf_, L.kc, L.vc, L.ks, L.vs, p_, QPC(p_), g * QPC(p_),
-                                                                     nullptr, rbcur_, nullptr, kvmap(L));
+                                                                     nullptr, rbcur_, nullptr, kvmap(L)); CUDA_TRACE_LAUNCH("k_qsa_prep"); }
                 k_qxlocal16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(qb, mr, xq, p_);
                 KCHK("q local");
             } else {
             xb_add(XB_Q, (size_t)mr * qper(p_) * (q16 ? 2 : 4) * (p_.ngpu - 1));
             if (p_.ngpu < 2) {}  // pipeline stage (1 rank): every head is local, nothing to send
-            else if (q16) k_qxsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
-            else k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_);
+            else if (q16) { k_qxsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_); CUDA_TRACE_LAUNCH("k_qxsend16"); }
+            else { k_qxsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, qs>>>(qb, mr, xqs, p_); CUDA_TRACE_LAUNCH("k_qxsend"); }
             KCHK("k_qxsend");
             if (qstg) xchg_send(0, xq, qpar, mr, (size_t)qper(p_) * (q16 ? 2 : 4), qper(p_), qs);
             }
@@ -4506,16 +4506,16 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // scores differ (~1e-6) between being prefilled and being decoded (review M2). FLASH_IDX_TC=0: master's
                 // fp32 path; FLASH_IDX_TILE=0 turns off both the tile and the tensor-core kernel (FLASH_IDX_TC then no-op)
                 static const bool itc = env_int("FLASH_IDX_TC", 1);
-                if (itc && pf_ && ist)
-                    k_idx_score_mma<<<dim3((lbmax + IT_BLK - 1) / IT_BLK, (mr + IT_ROWS - 1) / IT_ROWS), 256, IT_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_);
-                else if (ist && mr > 8)  // rows x blocks tiles: keys read once per 16 rows
-                    k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_);
-                else
-                k_idx_score<<<dim3((lbmax + 255) / 256, mr), 256, 0, st_>>>(L.ikb, iq, pp, p_, lbmax, iscore_, nullptr, rbcur_);
+                if (itc && pf_ && ist){ 
+                    k_idx_score_mma<<<dim3((lbmax + IT_BLK - 1) / IT_BLK, (mr + IT_ROWS - 1) / IT_ROWS), 256, IT_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score_mma"); }
+                else if (ist && mr > 8)  { // rows x blocks tiles: keys read once per 16 rows
+                    k_idx_score_t<<<dim3((lbmax + IS_BLK - 1) / IS_BLK, (mr + IS_ROWS - 1) / IS_ROWS), 256, IS_SMEM, st_>>>(L.ikb, iq, pp, p_, lbmax, mr, iscore_, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score_t"); }
+                else{ 
+                k_idx_score<<<dim3((lbmax + 255) / 256, mr), 256, 0, st_>>>(L.ikb, iq, pp, p_, lbmax, iscore_, nullptr, rbcur_); CUDA_TRACE_LAUNCH("k_idx_score"); }
                 KCHK("k_idx_score");
                 const int ilt = idx_local_threads(mr);
-                if (idx_gk_) k_idx_local<true><<<mr, ilt, 0, st_>>>(iscore_, pp, p_, lbmax, iloc_);
-                else k_idx_local<<<mr, ilt, (size_t)lbmax * 4, st_>>>(iscore_, pp, p_, lbmax, iloc_);
+                if (idx_gk_) { k_idx_local<true><<<mr, ilt, 0, st_>>>(iscore_, pp, p_, lbmax, iloc_); CUDA_TRACE_LAUNCH("k_idx_local"); }
+                else { k_idx_local<<<mr, ilt, (size_t)lbmax * 4, st_>>>(iscore_, pp, p_, lbmax, iloc_); CUDA_TRACE_LAUNCH("k_idx_local"); }
                 KCHK("k_idx_local");
                 // copy-engine path (FLASH_COMM=ce): the keys go into a local outbox, then by peer copies + a flag copy
                 // (as q / partials); else SM stores into the peers' memory (P2P), which on links with a high SM-store
@@ -4534,30 +4534,30 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 } else if (isb > 0 && !istg && ipace == 0.f && xiscnt_) {
                     Xchg xs = xis;
                     xs.scnt = xiscnt_;
-                    k_idx_send16<<<dim3(p_.ngpu - 1, std::min(isb, (mr + 3) / 4)), 256, 0, st_>>>(iloc_, mr, xs, p_);
-                } else
-                k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, mr, xis, p_, ipace, comm_.lbusy[p_.rank]);
+                    k_idx_send16<<<dim3(p_.ngpu - 1, std::min(isb, (mr + 3) / 4)), 256, 0, st_>>>(iloc_, mr, xs, p_); CUDA_TRACE_LAUNCH("k_idx_send16");
+                } else{ 
+                k_idx_send<<<p_.ngpu - 1, 256, 0, st_>>>(iloc_, mr, xis, p_, ipace, comm_.lbusy[p_.rank]); CUDA_TRACE_LAUNCH("k_idx_send"); }
                 if (istg) {
                     xchg_send(2, xi, ipar, mr, (size_t)IDX_TOPB * 4, IDX_TOPB, st_);
                     ce_prewait(xi);  // (k_idx_select waits for the peers' keys)
                 }
                 xb_add(XB_IDX, ib * (p_.ngpu - 1));
                 // (KV streaming: the rows' keys made resident by the same blocks, kv_need below skipped)
-                if (!istg) xpull(xi, 2, mr, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
+                if (!istg) { xpull(xi, 2, mr, 0, IDX_TOPB);  // (no peer access: the flags into device memory)
                 k_idx_select<<<mr, 1024, 0, st_>>>(iscore_, iloc_, pp, p_, lbmax, xi, isel_, insel_, nullptr, idx_gk_,
-                                                   kvs_ ? L.kvp : KvPool(), rbcur_, mr <= MAXM ? psel_ : nullptr);
+                                                   kvs_ ? L.kvp : KvPool(), rbcur_, mr <= MAXM ? psel_ : nullptr); CUDA_TRACE_LAUNCH("k_idx_select"); }
                 KCHK("k_idx_select");
-                if (dh) k_dbg_selhash<<<mr, 256, 0, st_>>>(isel_, insel_, lbmax, dh + 8);
+                if (dh) { k_dbg_selhash<<<mr, 256, 0, st_>>>(isel_, insel_, lbmax, dh + 8); CUDA_TRACE_LAUNCH("k_dbg_selhash"); }
                 static const bool selwin = env_int("FLASH_SELWIN", 0);
                 if (selwin && sw_c_) {
                     const int lx = li < 0 ? LAYERS : li;
                     k_sel_win<<<1, 1024, 0, st_>>>(isel_, insel_, pp, mr, lbmax, p_, sw_stamp_ + (size_t)lx * lbmax, sw_cid_ + lx,
-                                                   sw_c_ + (pf_ ? 16 : 0));
+                                                   sw_c_ + (pf_ ? 16 : 0)); CUDA_TRACE_LAUNCH("k_sel_win");
                 }
                 static const bool selstat = env_int("FLASH_SELSTAT", 0);
                 if (selstat && pf_) {
-                    if (!selst_) selst_ = (unsigned long long*)dalloc(3 * 8);
-                    k_sel_union<<<(mr + QP_R - 1) / QP_R, 256, 0, st_>>>(isel_, insel_, mr, lbmax, selst_);
+                    if (!selst_) { selst_ = (unsigned long long*)dalloc(3 * 8);
+                    k_sel_union<<<(mr + QP_R - 1) / QP_R, 256, 0, st_>>>(isel_, insel_, mr, lbmax, selst_); CUDA_TRACE_LAUNCH("k_sel_union"); }
                 }
             }
             if (qside) CUDA_CHECK(cudaStreamWaitEvent(st_, pfq1_, 0));  // join the q exchange
@@ -4573,10 +4573,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     d.o[0] = attn_x_;
                     auto tf = kv4_ ? (x16 ? k_qsa_attn_tc2<2, true, true> : k_qsa_attn_tc2<2, false, true>)
                                    : (x16 ? k_qsa_attn_tc2<2, true> : k_qsa_attn_tc2<2>);
-                    tf<<<dim3(NQ / 2, (mr + 31) / 32, 1), 128, TB_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, kvmap(L));
-                } else
+                    tf<<<dim3(NQ / 2, (mr + 31) / 32, 1), 128, TB_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, kvmap(L)); CUDA_TRACE_LAUNCH("tf");
+                } else{ 
                 k_qsa_attn_tc<<<dim3(NQ, (mr + TA_ROWS - 1) / TA_ROWS), 128, TA_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp,
-                                                                                            attn_x_, p_, xq, mr, rbcur_);
+                                                                                            attn_x_, p_, xq, mr, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_tc"); }
             } else if (dec_k_ && mr <= XROWS && !(pf_ && env_str("FLASH_DEC_NOPF"))) {
                 // decode / verify rows: GQA tile (12 heads of a kv head x 16-key tiles), keys split over S blocks per
                 // (kv head, row), with or without block selection
@@ -4614,13 +4614,13 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     // the row groups' block unions once (prefill-r4)
                     QpUnion qu = qpu_;
                     qu.ctr = nullptr;
-                    k_qpf_union<<<(mr + QP_R - 1) / QP_R, 256, (size_t)((lbmax + 31) / 32) * 4, st_>>>(isel_, insel_, mr, lbmax, qu);
+                    k_qpf_union<<<(mr + QP_R - 1) / QP_R, 256, (size_t)((lbmax + 31) / 32) * 4, st_>>>(isel_, insel_, mr, lbmax, qu); CUDA_TRACE_LAUNCH("k_qpf_union");
                     // persistent blocks over the (kv head, split, row group) items (prefill-r4, opt-in FLASH_QPF_PERSIST=1;
                     // default: one item per block until a test round validates it)
                     static const bool qps = env_int("FLASH_QPF_PERSIST", 0);
                     const int ngrp = (mr + QP_R - 1) / QP_R;
                     const int qdbg = ce_x && qpf_dbg == 0 ? 5 : qpf_dbg;
-                    if (qdbg == 5) k_qpf_qwait<<<1, 32, 0, st_>>>(xq, p_);
+                    if (qdbg == 5) { k_qpf_qwait<<<1, 32, 0, st_>>>(xq, p_); CUDA_TRACE_LAUNCH("k_qpf_qwait"); }
                     if (qps && qpu_.ctr) {
                         qu.ctr = qpu_.ctr;
                         qu.S = S;
@@ -4634,17 +4634,17 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                             else if (same > 1 && comm_.p2p) nsm_ = std::max(1, nsm_ / same);
                         }
                         kf<<<std::min(nsm_, NKV * ngrp * S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, isel_,
-                                                                                insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp, kvmap(L));
-                    } else
+                                                                                insel_, lbmax, mr, rbcur_, q16, qdbg, qu, ngrp, kvmap(L)); CUDA_TRACE_LAUNCH("kf");
+                    } else{ 
                     kf<<<dim3(NKV, ngrp, S), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d,
-                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qdbg, qu, 0, kvmap(L));
-                    if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
+                                                                                p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, qdbg, qu, 0, kvmap(L)); CUDA_TRACE_LAUNCH("kf"); }
+                    if (S > 1) { k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S); CUDA_TRACE_LAUNCH("k_attn_merge"); }
                     static const bool qnan = env_int("FLASH_QPF_NAN", 0);  // debug: first NaN (device-side)
                     if (qnan) {
                         if (!qnan_rec_) { CUDA_CHECK(cudaHostAlloc((void**)&qnan_rec_, 4096 * 16, cudaHostAllocMapped)); memset(qnan_rec_, 0, 4096 * 16); }
                         if (qnan_n_ < 4096) {
                             qnan_meta_.push_back({li, cposh_[2 * (int)(posd_ - cposd_) / 2]});
-                            k_qnan<<<64, 256, 0, st_>>>(qb, xqpr_[p_.rank], xqseq_, p_.ngpu, p_.rank, mr, qper(p_), q16, attn_x_, qnan_rec_ + 4 * qnan_n_);
+                            k_qnan<<<64, 256, 0, st_>>>(qb, xqpr_[p_.rank], xqseq_, p_.ngpu, p_.rank, mr, qper(p_), q16, attn_x_, qnan_rec_ + 4 * qnan_n_); CUDA_TRACE_LAUNCH("k_qnan");
                             qnan_n_++;
                         }
                     }
@@ -4659,8 +4659,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 auto qdf = kv4_ ? (kv1 ? k_qsa_dec<true, 0, true> : k_qsa_dec<false, 0, true>) : kv1 ? k_qsa_dec<true> : k_qsa_dec<false>;
                 qdf<<<dim3(NKV, mr, S), 128, kv1 ? QD_SMEM1 : QD_SMEM, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq,
                                                                         sel_on_ ? isel_ : nullptr, insel_, lbmax, nullptr, rbcur_, q16, kvmap(L),
-                                                                        kvs_ && mr <= MAXM ? psel_ : nullptr, mr <= MAXM ? qd_mint(mr, S) : 0);
-                if (S > 1) k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S);
+                                                                        kvs_ && mr <= MAXM ? psel_ : nullptr, mr <= MAXM ? qd_mint(mr, S) : 0); CUDA_TRACE_LAUNCH("qdf");
+                if (S > 1) { k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, S); CUDA_TRACE_LAUNCH("k_attn_merge"); }
                 static const bool qcmp = env_int("FLASH_QPF_CMP", 0);
                 if (qcmp && !kv4_ && pf_ && sel_on_ && mr > MAXM && attnB_ && S == 1) {  // debug: k_qsa_pfsel shadow vs k_qsa_dec (eager)
                     const size_t smem = qpf_smem(lbmax);
@@ -4669,12 +4669,12 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     d2.o[0] = attnB_;
                     QpUnion qu = qpu_;
                     qu.ctr = nullptr;
-                    k_qpf_union<<<(mr + QP_R - 1) / QP_R, 256, (size_t)((lbmax + 31) / 32) * 4, st_>>>(isel_, insel_, mr, lbmax, qu);
+                    k_qpf_union<<<(mr + QP_R - 1) / QP_R, 256, (size_t)((lbmax + 31) / 32) * 4, st_>>>(isel_, insel_, mr, lbmax, qu); CUDA_TRACE_LAUNCH("k_qpf_union");
                     k_qsa_pfsel<true, true><<<dim3(NKV, (mr + QP_R - 1) / QP_R, 1), QP_W * 32, smem, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, d2,
-                                                                                                    p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, 3, qu);
+                                                                                                    p_, xq, isel_, insel_, lbmax, mr, rbcur_, q16, 3, qu); CUDA_TRACE_LAUNCH("k_qsa_pfsel");
                     unsigned* cs = reinterpret_cast<unsigned*>(attnB_ + (size_t)XROWS * NQ * (HD + 2));  // (after the partials: 80 bytes of slack)
                     CUDA_CHECK(cudaMemsetAsync(cs, 0, 80, st_));
-                    k_cmp_attn<<<mr, 32, 0, st_>>>(attn_x_, attnB_, mr, cs);
+                    k_cmp_attn<<<mr, 32, 0, st_>>>(attn_x_, attnB_, mr, cs); CUDA_TRACE_LAUNCH("k_cmp_attn");
                     unsigned h[20];
                     CUDA_CHECK(cudaMemcpyAsync(h, cs, 80, cudaMemcpyDeviceToHost, st_));
                     CUDA_CHECK(cudaStreamSynchronize(st_));
@@ -4692,19 +4692,19 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // decode / verify rows: tensor-core kernel with the keys split over gridDim.z blocks, merged after
                 AttnDst d{};
                 d.o[0] = attn_x_;
-                for (int z = 1; z < attn_split_; z++) d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
+                for (int z = 1; z < attn_split_; z++) { d.o[z] = attn_spl_ + (size_t)(z - 1) * XROWS * NQ * (HD + 2);
                 (kv4_ ? k_qsa_attn_tc2<2, false, true> : k_qsa_attn_tc2<2>)<<<dim3(NQ / 2, (mr + 31) / 32, attn_split_), 128, TB_SMEM, st_>>>(
-                    qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, KvMap());
-                k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, attn_split_);
-            } else if (rows_k && mr > 8)  // many rows: one warp per row, rows of a block share K/V
+                    qb, L.kc, L.vc, L.ks, L.vs, pp, d, p_, xq, mr, rbcur_, KvMap()); CUDA_TRACE_LAUNCH("k_qsa_attn_tc2"); }
+                k_attn_merge<<<dim3(NQ, mr), HD, 0, st_>>>(d, attn_split_); CUDA_TRACE_LAUNCH("k_attn_merge");
+            } else if (rows_k && mr > 8)  { // many rows: one warp per row, rows of a block share K/V
                 k_qsa_attn_rows<<<dim3(NQ, (mr + 7) / 8), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, xq,
-                                                                          sel_on_ ? isel_ : nullptr, insel_, lbmax, mr, rbcur_);
-            else
+                                                                          sel_on_ ? isel_ : nullptr, insel_, lbmax, mr, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_rows"); }
+            else{ 
                 k_qsa_attn_b<<<dim3(NQ, mr), 256, 0, st_>>>(qb, L.kc, L.vc, L.ks, L.vs, pp, attn_x_, p_, xq,
-                                                             sel_on_ ? isel_ : nullptr, insel_, lbmax, rbcur_);
+                                                             sel_on_ ? isel_ : nullptr, insel_, lbmax, rbcur_); CUDA_TRACE_LAUNCH("k_qsa_attn_b"); }
         }
         KCHK("k_qsa_attn");
-        if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(attn_x_), (size_t)mr * NQ * (HD + 2), dh + 9);
+        if (dh) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(attn_x_), (size_t)mr * NQ * (HD + 2), dh + 9); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
         const float* prow = proj_ + (size_t)t0 * ld;
         bf16* abr = ab_ + (size_t)t0 * ql * HD;
         if (p2p) {  // (without peer access the receive slots are pinned host memory, palloc)
@@ -4728,9 +4728,9 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
                 // copies + flag (value computed here, before the pending chunk's combine bumps the counter) on xcs_
                 if (cstg && xce_rec_[cpar]) CUDA_CHECK(cudaStreamWaitEvent(st_, xce_[cpar], 0));
-                if (p_.ngpu > 1) k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_, qsa_ahead_);
+                if (p_.ngpu > 1) { k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_, qsa_ahead_); CUDA_TRACE_LAUNCH("k_xsend16"); }
                 if (cstg) {
-                    k_seq_word<<<1, 1, 0, st_>>>(xsw_ + 4 + cpar, xc.seq, qsa_ahead_);
+                    k_seq_word<<<1, 1, 0, st_>>>(xsw_ + 4 + cpar, xc.seq, qsa_ahead_); CUDA_TRACE_LAUNCH("k_seq_word");
                     CUDA_CHECK(cudaEventRecord(xcf_, st_));
                     CUDA_CHECK(cudaStreamWaitEvent(xcs_, xcf_, 0));
                     xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_), xcs_, xsw_ + 4 + cpar);
@@ -4742,16 +4742,16 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 qsa_deferred_ = true;
                 return;
             } else if (x16o) {
-                if (p_.ngpu > 1) k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
+                if (p_.ngpu > 1) { k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_); CUDA_TRACE_LAUNCH("k_xsend16"); }
                 if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_)); ce_prewait(xc); }
-                else xpull(xc, 1, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_));
-                k_qsa_comb16<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD, kv4_);
+                else { xpull(xc, 1, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_));
+                k_qsa_comb16<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD, kv4_); CUDA_TRACE_LAUNCH("k_qsa_comb16"); }
             } else {
-            if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
+            if (p_.ngpu > 1) { k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_); CUDA_TRACE_LAUNCH("k_xsend"); }
             KCHK("k_xsend");
             if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)xper(p_) * 4, xper(p_)); ce_prewait(xc); }
-            else xpull(xc, 1, mr, (size_t)xper(p_) * 4, xper(p_));
-            k_qsa_comb2<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD, kv4_);
+            else { xpull(xc, 1, mr, (size_t)xper(p_) * 4, xper(p_));
+            k_qsa_comb2<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD, kv4_); CUDA_TRACE_LAUNCH("k_qsa_comb2"); }
             }
             KCHK("k_qsa_comb2");
         } else {
@@ -4762,10 +4762,10 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             KCHK("k_qsa_comb");
         }
     }
-    if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(ab_), (size_t)m * ql * HD / 2, dh + 10);
+    if (dh) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(ab_), (size_t)m * ql * HD / 2, dh + 10); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
     rows8(L.o, ab_, ql * HD, part_, H, m, st_);
     if (!ijoined) CUDA_CHECK(cudaStreamWaitEvent(st_, pfe1_, 0));
-    if (dh) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dh + 11);
+    if (dh) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dh + 11); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
 }
 
 void Worker::xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per) {
@@ -4816,8 +4816,8 @@ void Worker::ce_prewait(const Xchg& x) {
     // condition.
     static const int mode = env_int("FLASH_CE_PREWAIT", 1);
     const bool side_kernels = comm_.lemu > 0.f || comm_.xfer == kXferHost;
-    if ((mode >= 2 || (mode == 1 && side_kernels)) && pf_ && p_.ngpu > 1 && (comm_.xfer == kXferCE || comm_.xfer == kXferHost))
-        k_qpf_qwait<<<1, 32, 0, st_>>>(x, p_);
+    if ((mode >= 2 || (mode == 1 && side_kernels)) && pf_ && p_.ngpu > 1 && (comm_.xfer == kXferCE || comm_.xfer == kXferHost)){ 
+        k_qpf_qwait<<<1, 32, 0, st_>>>(x, p_); CUDA_TRACE_LAUNCH("k_qpf_qwait"); }
 }
 
 void Worker::qsa_back(int slot) {
@@ -4832,8 +4832,8 @@ void Worker::qsa_back(int slot) {
     xc.seq = xseq_;
     xc.done = xdone_;
     xc.scnt = xscnt_;
-    if (q.ce) ce_prewait(xc);  // (the partials of this chunk come by the side stream's copies)
-    k_qsa_comb16<<<dim3(q.ql, q.mr), HD, 0, st_>>>(q.ax, q.mr, q.prow, q.ld, ab_, q.ql * HD, xc, p_, q.nqp * HD, kv4_);
+    if (q.ce) { ce_prewait(xc);  // (the partials of this chunk come by the side stream's copies)
+    k_qsa_comb16<<<dim3(q.ql, q.mr), HD, 0, st_>>>(q.ax, q.mr, q.prow, q.ld, ab_, q.ql * HD, xc, p_, q.nqp * HD, kv4_); CUDA_TRACE_LAUNCH("k_qsa_comb16"); }
     KCHK("k_qsa_comb16 (back)");
     rows8(q.L->o, ab_, q.ql * HD, part_, H, q.mr, st_);
     q.L = nullptr;
@@ -4846,8 +4846,8 @@ void Worker::moe(Layer& L, int m) {
         if (moe_pre_) {
         } else {
         if (L.router8.q) { rows8(L.router8, x_, H, rlog_, 528, m, st_); ns = 1; }
-        else gemv_w16_rows(L.router, x_, H, rlog_, 528, m, st_, 4, (size_t)m * 528);
-        k_topk_rows<<<m, NE, 0, st_>>>(rlog_, ns, gsel_, gw_, gsh_, L.stats, m);
+        else { gemv_w16_rows(L.router, x_, H, rlog_, 528, m, st_, 4, (size_t)m * 528);
+        k_topk_rows<<<m, NE, 0, st_>>>(rlog_, ns, gsel_, gw_, gsh_, L.stats, m); CUDA_TRACE_LAUNCH("k_topk_rows"); }
         }
         // down into the slot buffer + ordered sums (not in deterministic mode: its fixed-point atomics are exact)
         // when the batch's slots fit the mixer scratch block
@@ -4880,16 +4880,16 @@ void Worker::moe(Layer& L, int m) {
         KCHK("k_jobs_pf");
         if (!detpart_ && !slot && !win) CUDA_CHECK(cudaMemsetAsync(part_, 0, (size_t)m * H * 4, st_));
         const int mj = std::min(maxjob_pf_, maxjob_ + maxlg_ * ((m * (TOPK + 1) + PF_SHJ - 1) / PF_SHJ));  // bound of the job count
-        k_jobtrap<<<1, 1, 0, st_>>>(njobs_, mj);  // a count past the grid would drop expert work silently: abort instead
+        k_jobtrap<<<1, 1, 0, st_>>>(njobs_, mj); CUDA_TRACE_LAUNCH("k_jobtrap");  // a count past the grid would drop expert work silently: abort instead
         static const bool jobchk = env_int("FLASH_JOBCHK", 0);
         if (jobchk) { if (!jobchk_) { CUDA_CHECK(cudaHostAlloc((void**)&jobchk_, 32, cudaHostAllocMapped)); memset(jobchk_, 0, 32); }
-                      k_jobchk<<<1, 1, 0, st_>>>(njobs_, mj, maxjob_pf_, 1, m, jobchk_); }
+                      k_jobchk<<<1, 1, 0, st_>>>(njobs_, mj, maxjob_pf_, 1, m, jobchk_); CUDA_TRACE_LAUNCH("k_jobchk"); }
         // W4A8 gate_up (prefill-r3): the part's XH rows are quantized in place (each row's XQ bytes + scales fit its
         // 2H bytes; the rows are dead after this MoE, the next layer's input is gathered into them later)
         {
             int8_t* const xq = reinterpret_cast<int8_t*>(xh_);
             float2* const xqs = reinterpret_cast<float2*>(xq + H);
-            if (!moe_pre_) k_xh_to_q<64><<<m, 160, 0, st_>>>(xh_, xq, xqs);
+            if (!moe_pre_) { k_xh_to_q<64><<<m, 160, 0, st_>>>(xh_, xq, xqs); CUDA_TRACE_LAUNCH("k_xh_to_q"); }
             // half-group blocks (WT = 1: 128 registers, 2 blocks / SM). The whole-group variant (WT = 2, 248 registers,
             // 1 block / SM; tools/mb/mb_gu_det.cu) gave different activations for a few tokens now and then next to the
             // engine's other streams in an earlier test setup, and later proved deterministic but not faster.
@@ -4900,24 +4900,24 @@ void Worker::moe(Layer& L, int m) {
                 CUDA_CHECK(cudaMemcpyAsync((char*)xqsnap_ + (size_t)pfbn_ * H * 2, pftl_, (size_t)m * (TOPK + 1) * 4, cudaMemcpyDeviceToDevice, st_));
             }
             lend_use(pfact_, (size_t)m * (TOPK + 1) * NGRP * GRP * 2, "MoE activations (pfact_)");
-            k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
+            k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_); CUDA_TRACE_LAUNCH("k_moe_gu_q");
             static const bool gu2x = env_int("FLASH_DBG_GU2X", 0);  // debug: gate_up twice
             if (gu2x && actsnap_) {
                 const size_t rows = pfact_bytes_ / (GRP * 2);
                 CUDA_CHECK(cudaMemcpyAsync(actsnap_, pfact_, pfact_bytes_, cudaMemcpyDeviceToDevice, st_));
-                k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_);
-                k_cmp_rows<<<(unsigned)rows, 64, 0, st_>>>(reinterpret_cast<const unsigned*>(pfact_), reinterpret_cast<const unsigned*>(actsnap_), (int)rows, GRP / 2, xqrec_, li_dbg, 2);
+                k_moe_gu_q<64, 1><<<2 * mj, 256, 0, st_>>>(pfjobs_, njobs_, pftl_, pfwl_, xq, xqs, pfact_); CUDA_TRACE_LAUNCH("k_moe_gu_q");
+                k_cmp_rows<<<(unsigned)rows, 64, 0, st_>>>(reinterpret_cast<const unsigned*>(pfact_), reinterpret_cast<const unsigned*>(actsnap_), (int)rows, GRP / 2, xqrec_, li_dbg, 2); CUDA_TRACE_LAUNCH("k_cmp_rows");
             }
             if (xqchk && xqsnap_) {
-                k_cmp_rows<<<m, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), reinterpret_cast<const unsigned*>(xqsnap_), m, H / 2, xqrec_, li_dbg, 0);
-                k_cmp_rows<<<1, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(pftl_), reinterpret_cast<const unsigned*>((char*)xqsnap_ + (size_t)pfbn_ * H * 2), 1, m * (TOPK + 1), xqrec_, li_dbg, 1);
+                k_cmp_rows<<<m, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), reinterpret_cast<const unsigned*>(xqsnap_), m, H / 2, xqrec_, li_dbg, 0); CUDA_TRACE_LAUNCH("k_cmp_rows");
+                k_cmp_rows<<<1, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(pftl_), reinterpret_cast<const unsigned*>((char*)xqsnap_ + (size_t)pfbn_ * H * 2), 1, m * (TOPK + 1), xqrec_, li_dbg, 1); CUDA_TRACE_LAUNCH("k_cmp_rows");
             }
         }
         KCHK("k_moe_gu_pf");
         if (slot || win) {
             // W4A8 down (prefill-r3): the act rows quantized in place, then s8 MMA (user decision: kernel -15 %)
             if (win) {
-                k_slot_cuts<<<1, 512, 0, st_>>>(m, gsel_, (int)srows, nwin, slcut_);
+                k_slot_cuts<<<1, 512, 0, st_>>>(m, gsel_, (int)srows, nwin, slcut_); CUDA_TRACE_LAUNCH("k_slot_cuts");
                 static bool said = false;
                 if (!said && p_.rank == 0) {
                     said = true;
@@ -4937,23 +4937,23 @@ void Worker::moe(Layer& L, int m) {
                     if (!maxloc_) maxloc_ = NGRP;
                 }
                 const int nact = m * (TOPK + 1) * maxloc_;  // bound of the act rows of this part
-                k_act_to_q<<<(nact * 8 + 255) / 256, 256, 0, st_>>>(pfact_, nact);
+                k_act_to_q<<<(nact * 8 + 255) / 256, 256, 0, st_>>>(pfact_, nact); CUDA_TRACE_LAUNCH("k_act_to_q");
             }
             static const int dtt = env_int("FLASH_MOE_DQT", 2);
             // [qfn-moe-ncu] half2 slot stores + 3 blocks per SM (168 registers; ncu: 16 % occupancy, long-scoreboard and
             // lg-throttle stalls); bit-identical. FLASH_MOE_DN_PK=0: the old kernel (2-byte stores, 254 registers)
             static const bool dpk = env_int("FLASH_MOE_DN_PK", 1);
-            if (dtt == 1 && dpk) k_moe_dn_q<1><<<dim3(H / 16 / 4, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb);
-            else if (dtt == 1) k_moe_dn_q<1, false><<<dim3(H / 16 / 4, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb);
-            else if (dpk) k_moe_dn_q<2, true, 3><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb);
-            else k_moe_dn_q<2, false><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb);
-            k_moe_sum<<<m, 320, 0, st_>>>(sb, pfinv_, m * TOPK, L.gmap, part_);
+            if (dtt == 1 && dpk) { k_moe_dn_q<1><<<dim3(H / 16 / 4, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb); CUDA_TRACE_LAUNCH("k_moe_dn_q"); }
+            else if (dtt == 1) { k_moe_dn_q<1, false><<<dim3(H / 16 / 4, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb); CUDA_TRACE_LAUNCH("k_moe_dn_q"); }
+            else if (dpk) { k_moe_dn_q<2, true, 3><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb); CUDA_TRACE_LAUNCH("k_moe_dn_q"); }
+            else { { k_moe_dn_q<2, false><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pfact_, sb); CUDA_TRACE_LAUNCH("k_moe_dn_q"); }
+            k_moe_sum<<<m, 320, 0, st_>>>(sb, pfinv_, m * TOPK, L.gmap, part_); CUDA_TRACE_LAUNCH("k_moe_sum"); }
             }
         } else {
-            k_moe_dn_pf<2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_);
+            k_moe_dn_pf<2><<<dim3(H / 16 / 8, mj), 128, 0, st_>>>(pfjobs_, njobs_, pftl_, pfact_, part_, detpart_); CUDA_TRACE_LAUNCH("k_moe_dn_pf");
         }
         KCHK("k_moe_dn_pf");
-        if (detpart_) k_fx_to_f<<<256, 256, 0, st_>>>(detpart_, part_, (size_t)m * H);
+        if (detpart_) { k_fx_to_f<<<256, 256, 0, st_>>>(detpart_, part_, (size_t)m * H); CUDA_TRACE_LAUNCH("k_fx_to_f"); }
         if (!rdump_.empty() && &L != &mtp_) {  // debug routing dump (eager): this prefill's rows at rd_pos_
             const size_t li = &L - L_.data(), np = rdump_.size() / LAYERS / TOPK;
             if (rd_pos_ + m <= (int)np)
@@ -4964,8 +4964,8 @@ void Worker::moe(Layer& L, int m) {
         if (dbgh_) {  // routing and this card's MoE partial of the layer (debug hash)
             const int li = (int)(&L - L_.data());
             const int slot = li >= 0 && li < LAYERS ? li : LAYERS;
-            k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(gsel_), (size_t)m * TOPK, dbgh_ + slot * DBGK + 1);
-            k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dbgh_ + slot * DBGK + 2);
+            k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(gsel_), (size_t)m * TOPK, dbgh_ + slot * DBGK + 1); CUDA_TRACE_LAUNCH("k_dbg_hash");
+            k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), (size_t)m * H, dbgh_ + slot * DBGK + 2); CUDA_TRACE_LAUNCH("k_dbg_hash");
         }
         return;
     }
@@ -4989,20 +4989,20 @@ void Worker::moe(Layer& L, int m) {
                                   grouped ? jrow_ : nullptr);
         KCHK("k_jobs");
     } else {
-        k_route2<<<1, NE, 0, st_>>>(rlog_, m, L.gmap, L.groups, jobs_, jw_, njobs_, RS, L.stats, ctab(L), L.ndev, coldcnt_);
+        k_route2<<<1, NE, 0, st_>>>(rlog_, m, L.gmap, L.groups, jobs_, jw_, njobs_, RS, L.stats, ctab(L), L.ndev, coldcnt_); CUDA_TRACE_LAUNCH("k_route2");
     }
     }
     // grid over the worst-case job count of this card (blocks past *njobs exit)
     const int maxj = std::min(maxjob_, NGRP * (m * TOPK + 1));  // blocks past *njobs exit
     static const bool jobchk_d = env_int("FLASH_JOBCHK", 0);
     if (jobchk_d) { if (!jobchk_) { CUDA_CHECK(cudaHostAlloc((void**)&jobchk_, 32, cudaHostAllocMapped)); memset(jobchk_, 0, 32); }
-                    k_jobchk<<<1, 1, 0, st_>>>(njobs_, maxj, maxjob_, 2, m, jobchk_); }
+                    k_jobchk<<<1, 1, 0, st_>>>(njobs_, maxj, maxjob_, 2, m, jobchk_); CUDA_TRACE_LAUNCH("k_jobchk"); }
     if (grouped) {
         static const int gy = env_int("FLASH_MOE_GY", 320);  // job blocks (loop past it)
         k_moe_gu_g<<<dim3(2 * GRP / 16, std::min(maxj, gy > 0 ? gy : maxj)), 128, 0, st_>>>(jobs_, njobs_, jrow_, jw_, xh_, acth_);
         KCHK("k_moe_gu_g");
-        if (dn_fx_) k_moe_dn_g<true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
-        else k_moe_dn_g<false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m);
+        if (dn_fx_) { k_moe_dn_g<true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn_g"); }
+        else { k_moe_dn_g<false><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, jrow_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn_g"); }
         KCHK("k_moe_dn_g");
         return;
     }
@@ -5010,10 +5010,10 @@ void Worker::moe(Layer& L, int m) {
     KCHK("k_moe_gu");
     if (dn_fx_) {  // full batch invariance (FLASH_ATTN_CHUNK=1): fixed-point sums
         const int nt = (m + 7) / 8;
-        if (nt == 1) k_moe_dn<1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-        else if (nt == 2) k_moe_dn<2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-        else if (nt == 3) k_moe_dn<3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
-        else k_moe_dn<4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m);
+        if (nt == 1) { k_moe_dn<1, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn"); }
+        else if (nt == 2) { k_moe_dn<2, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn"); }
+        else if (nt == 3) { k_moe_dn<3, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn"); }
+        else { k_moe_dn<4, true><<<H / 16, 256, 0, st_>>>(jobs_, njobs_, acth_, part_, m); CUDA_TRACE_LAUNCH("k_moe_dn"); }
     } else
     NT_LAUNCH(m, k_moe_dn, H / 16, 256, jobs_, njobs_, acth_, part_, m);
     KCHK("k_moe_dn");
@@ -5055,7 +5055,7 @@ void Worker::body(int m) {
 void Worker::trunk(int m, const int* toks) {
     ll_idx_ = 0;
     curpos_ = posd_;
-    k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    k_step_bump<<<1, 1, 0, st_>>>(stepc_); CUDA_TRACE_LAUNCH("k_step_bump");
     // pipeline stage after the first: the residual rows come from the previous stage (decode: its device staging rows,
     // filled before the launch; prefill: already in the batch R, pp_in_rows)
     if (!p_.first()) {
@@ -5086,7 +5086,7 @@ void Worker::trunk(int m, const int* toks) {
         bdump(li, 1, m, m);
         if (cap_) {  // activation capture (eager): the layer output with its steering applied
             steer_flush(m);
-            k_capture<<<(H + 255) / 256, 256, 0, st_>>>(R_, inj_, ypend_ ? y_ : nullptr, m, cap_skip_, cap_ + (size_t)li * H);
+            k_capture<<<(H + 255) / 256, 256, 0, st_>>>(R_, inj_, ypend_ ? y_ : nullptr, m, cap_skip_, cap_ + (size_t)li * H); CUDA_TRACE_LAUNCH("k_capture");
         }
         if (dump_) {  // debug (eager only): residual after every layer ([48][m][10240])
             flush_y(m);
@@ -5145,11 +5145,11 @@ __global__ void k_ban_rows(float* __restrict__ logits, int n, int m, const int* 
 }
 
 __global__ void k_ban_bind(int* __restrict__ cur, int s) { *cur = s; }
-void Worker::ban_bind(int s) { k_ban_bind<<<1, 1, 0, st_>>>(bcur_d_, s); }
+void Worker::ban_bind(int s) { k_ban_bind<<<1, 1, 0, st_>>>(bcur_d_, s); CUDA_TRACE_LAUNCH("k_ban_bind"); }
 
 void Worker::ban_apply(int m, int n, const int* rows) {
-    if (!ban_any_) return;
-    k_ban_rows<<<(m + 63) / 64, 64, 0, st_>>>(logits_, n, m, rows, bcur_d_, ban_d_, (int)slots_.size());
+    if (!ban_any_) { return;
+    k_ban_rows<<<(m + 63) / 64, 64, 0, st_>>>(logits_, n, m, rows, bcur_d_, ban_d_, (int)slots_.size()); CUDA_TRACE_LAUNCH("k_ban_rows"); }
 }
 
 void Worker::set_ban(int slot, const int* ids, int n) {
@@ -5177,13 +5177,13 @@ void Worker::set_ban(int slot, const int* ids, int n) {
 
 void Worker::head_sample(int m, int* dst) {  // full lm_head, local top-64 -> gathered -> same sample on every card
     const int nv = p_.voc1 - p_.voc0;
-    if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
+    if (nf_d_) { k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM); CUDA_TRACE_LAUNCH("k_nonfinite"); }  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
     if (con_) lp_copy(m);
-    if (con_) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS);
+    if (con_) { k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS); CUDA_TRACE_LAUNCH("k_mask_perm"); }
     ban_apply(m, nv, nullptr);  // (single sequence: the bound slot)
     topk_local(logits_, nv, m, 0, cand_, st_);
-    k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
+    k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_); CUDA_TRACE_LAUNCH("k_remap_cand");
     allgather_small(cand_, m * kTopK * 2, cand_all_, comm_, p_.rank, ctr_, st_);
     sample_rows(cand_all_, p_.ngpu, m, sp_, dst, st_, vchain_ && m > 1, vchain_ ? vtok_ + 1 : nullptr);
 }
@@ -5240,13 +5240,13 @@ void Worker::set_no_lookup(int slot, bool off) {
 
 void Worker::head_sample_b(int m, int* dst, const int* rs, const int* ext) {  // as head_sample, every row with its slot's parameters (greedy rows: argmax)
     const int nv = p_.voc1 - p_.voc0;
-    if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard, as in head()
+    if (nf_d_) { k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM); CUDA_TRACE_LAUNCH("k_nonfinite"); }  // guard, as in head()
     gemv_w8(lm_, x_, H, logits_, nv, m, st_);
     if (con_) lp_copy(m);
-    if (con_) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS);  // (a constrained batch of one)
+    if (con_) { k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, nv, lmap_, mask_d_, MASK_WORDS); CUDA_TRACE_LAUNCH("k_mask_perm"); }  // (a constrained batch of one)
     ban_apply(m, nv, rs ? rs : rslot_);
     topk_local(logits_, nv, m, 0, cand_, st_);
-    k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_);
+    k_remap_cand<<<(m * kTopK + 255) / 256, 256, 0, st_>>>(cand_, m * kTopK, lmap_); CUDA_TRACE_LAUNCH("k_remap_cand");
     allgather_small(cand_, m * kTopK * 2, cand_all_, comm_, p_.rank, ctr_, st_);
     sample_rows_slots(cand_all_, p_.ngpu, m, spslot_, rs ? rs : rslot_, sson_d_, dst, st_, ext);
 }
@@ -5387,13 +5387,13 @@ void Worker::head(int m, int* dst, bool draft) {  // lm_head (vocab slice) + dis
     const int* map = lmap_;
     if (draft && dlm_.q) { w = dlm_; map = dmap_; }  // balanced draft head
     else if (draft) w.n = ndraft_;  // draft vocabulary: the leading rows of the permuted head
-    else if (nf_d_) k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM);  // guard (FLASH_GUARD=0 off): nf_check
+    else if (nf_d_) { k_nonfinite<<<8, 256, 0, st_>>>(x_, m, H, nf_d_, nfr_d_, MAXM); CUDA_TRACE_LAUNCH("k_nonfinite"); }  // guard (FLASH_GUARD=0 off): nf_check
     gemv_w8(w, x_, H, logits_, w.n, m, st_);
     if (con_ && !draft) lp_copy(m);  // (the target head only: a draft head's logits are never read)
-    if (con_ && !draft) k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, w.n, map, mask_d_, MASK_WORDS);
+    if (con_ && !draft) { k_mask_perm<<<dim3(32, m), 256, 0, st_>>>(logits_, w.n, map, mask_d_, MASK_WORDS); CUDA_TRACE_LAUNCH("k_mask_perm"); }
     if (!draft) ban_apply(m, w.n, ban_rows_);
     if (draft && conf_head_) {  // [qfn-mtp-conf] + p(top-1) per row -> dconf_ (same token as argmax_local / final)
-        k_argmax_conf_local<<<m, 1024, 0, st_>>>(logits_, w.n, cpairs_, map, draft && dlm_.q ? dlm_real_ : w.n);
+        k_argmax_conf_local<<<m, 1024, 0, st_>>>(logits_, w.n, cpairs_, map, draft && dlm_.q ? dlm_real_ : w.n); CUDA_TRACE_LAUNCH("k_argmax_conf_local");
         allgather_small(cpairs_, 4 * m, cpairs_all_, comm_, p_.rank, ctr_, st_);
         k_argmax_conf_final<<<1, 32, 0, st_>>>(cpairs_all_, p_.ngpu, m, dst, dconf_);
         KCHK("draft head conf");
@@ -5792,7 +5792,7 @@ void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per,
                 CUDA_CHECK(cudaMemcpyAsync(x.recv[g] + ((size_t)par * ng + R) * XROWS * per, ob + (size_t)g * XROWS * xper(p_), bytes,
                                            cudaMemcpyDeviceToDevice, st));
         comm_link_emul(comm_, R, bytes * (ng - 1), st, 2 + e);
-        if (!flagw) k_seq_word<<<1, 1, 0, st>>>(xsw_ + e, x.seq);
+        if (!flagw) { k_seq_word<<<1, 1, 0, st>>>(xsw_ + e, x.seq); CUDA_TRACE_LAUNCH("k_seq_word"); }
         const unsigned* const fw = flagw ? flagw : xsw_ + e;
         for (int g = 0; g < ng; g++)
             if (g != R) CUDA_CHECK(cudaMemcpyAsync(x.flags[g] + R, fw, 4, cudaMemcpyDeviceToDevice, st));
@@ -5815,8 +5815,8 @@ void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per,
     // so the value was computed on the compute stream before the copies were forked)
     const unsigned* const sv = flagw ? flagw : x.seq;
     const int sa = flagw ? 0 : 1;
-    k_xs_flag<<<1, 32, 0, st>>>(fp, sv, R, ng, sa);
-    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * 4, sv, R, ng, sa);
+    k_xs_flag<<<1, 32, 0, st>>>(fp, sv, R, ng, sa); CUDA_TRACE_LAUNCH("k_xs_flag");
+    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * 4, sv, R, ng, sa); CUDA_TRACE_LAUNCH("k_xs_wait");
     if (!comm_.p2p) {  // never host -> host: such copy nodes in the prefill graphs ended in launch failures (v5, 3 cards
                        // without P2P, 32K / 90K): the staged slots must be device memory
         cudaPointerAttributes pa{};
@@ -5848,14 +5848,14 @@ void Worker::hc_rows(const HcW& w, float* R, float* inj, bf16* x, __half* xh, in
         unsigned long long* fu = sp_det;
         unsigned long long* fs = sp_det + (size_t)m * HC * HCD_ROWS;
         hcd_pf2(w, R, sp_hu, m, sp_hss, fu, fs, s);
-        k_fx_to_f<<<256, 256, 0, s>>>(fu, sp_hu, (size_t)m * HC * HCD_ROWS);
-        k_fx_to_f<<<64, 256, 0, s>>>(fs, sp_hss, (size_t)m * HC);
+        k_fx_to_f<<<256, 256, 0, s>>>(fu, sp_hu, (size_t)m * HC * HCD_ROWS); CUDA_TRACE_LAUNCH("k_fx_to_f");
+        k_fx_to_f<<<64, 256, 0, s>>>(fs, sp_hss, (size_t)m * HC); CUDA_TRACE_LAUNCH("k_fx_to_f");
     } else {
         CUDA_CHECK(cudaMemsetAsync(sp_hu, 0, (size_t)m * HC * HCD_ROWS * 4, s));
         CUDA_CHECK(cudaMemsetAsync(sp_hss, 0, (size_t)m * HC * 4, s));
         hcd_pf2(w, R, sp_hu, m, sp_hss, nullptr, nullptr, s);
     }
-    k_hc_mid_pf<<<m, 352, 0, s>>>(sp_hu, sp_hss, sp_hh, sp_rinv, inj);
+    k_hc_mid_pf<<<m, 352, 0, s>>>(sp_hu, sp_hss, sp_hh, sp_rinv, inj); CUDA_TRACE_LAUNCH("k_hc_mid_pf");
     static const int hy = env_int("FLASH_HCU_Y", 1);
     k_hcu_pf2<<<dim3((HCU_TILES + 7) / 8, std::max(1, std::min(hy, (m + 31) / 32))), 256, 0, s>>>(w.uq, w.us, sp_hh, sp_rinv, R, w.norm,
                                                                                                   x, xh, m);
@@ -5890,15 +5890,15 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
             ah.flags[g] = hagf_p_[g] ? hagf_p_[g] + ch * 8 : nullptr;
             ack.w[g] = hagf_p_[g] ? hagf_p_[g] + ch * 8 + 4 : nullptr;
         }
-        k_rag_ackwait<<<1, 32, 0, s>>>(hagf_ + ch * 8 + 4, a.seq, p_.rank, p_.ngpu);
+        k_rag_ackwait<<<1, 32, 0, s>>>(hagf_ + ch * 8 + 4, a.seq, p_.rank, p_.ngpu); CUDA_TRACE_LAUNCH("k_rag_ackwait");
         for (int k = 0; k < 3; k++)
             if (((amask >> k) & 1) && r1 > r0) {
                 CHECK(r1 - r0 <= AG_CAP, "row_ag: %d rows", r1 - r0);
                 CUDA_CHECK(cudaMemcpyAsync(hag_h_ + koff[k], a.dst[k][p_.rank] + (size_t)r0 * a.rowb[k], (size_t)(r1 - r0) * a.rowb[k],
                                            cudaMemcpyDeviceToHost, s));
             }
-        k_row_ag_flag<<<1, 32, 0, s>>>(ah, p_.rank, p_.ngpu);
-        k_row_ag_wait<<<1, 32, 0, s>>>(ah, p_.rank, p_.ngpu);
+        k_row_ag_flag<<<1, 32, 0, s>>>(ah, p_.rank, p_.ngpu); CUDA_TRACE_LAUNCH("k_row_ag_flag");
+        k_row_ag_wait<<<1, 32, 0, s>>>(ah, p_.rank, p_.ngpu); CUDA_TRACE_LAUNCH("k_row_ag_wait");
         for (int g = 0; g < p_.ngpu; g++) {
             const int g0 = rr[2 * g], g1 = rr[2 * g + 1];
             if (g == p_.rank || g1 <= g0) continue;
@@ -5926,21 +5926,21 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
             if (((amask >> k) & 1) && r1 > r0) eb += (size_t)(r1 - r0) * a.rowb[k] * (p_.ngpu - 1);
         comm_link_emul(comm_, p_.rank, eb, s, 1);
         if (agw_) {
-            k_seq_word<<<1, 1, 0, s>>>(agw_ + ch, a.seq);
+            k_seq_word<<<1, 1, 0, s>>>(agw_ + ch, a.seq); CUDA_TRACE_LAUNCH("k_seq_word");
             for (int g = 0; g < p_.ngpu; g++)
                 if (g != p_.rank) CUDA_CHECK(cudaMemcpyAsync(a.flags[g] + p_.rank, agw_ + ch, 4, cudaMemcpyDeviceToDevice, s));
         } else {
-            k_row_ag_flag<<<1, 32, 0, s>>>(a, p_.rank, p_.ngpu);  // (FLASH_AG_CE=1 without staging: the old SM flag)
+            k_row_ag_flag<<<1, 32, 0, s>>>(a, p_.rank, p_.ngpu); CUDA_TRACE_LAUNCH("k_row_ag_flag");  // (FLASH_AG_CE=1 without staging: the old SM flag)
         }
     } else if (rr && comm_.pullm) {  // P2P loads instead of stores on the pulled pairs (prefill-r4)
         a.pm = comm_.pullm;
-        k_row_ag_mix<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, r0, r1, p_.rank, p_.ngpu, amask);
-        k_row_ag_pull<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, p_.rank, p_.ngpu, amask);
+        k_row_ag_mix<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, r0, r1, p_.rank, p_.ngpu, amask); CUDA_TRACE_LAUNCH("k_row_ag_mix");
+        k_row_ag_pull<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, p_.rank, p_.ngpu, amask); CUDA_TRACE_LAUNCH("k_row_ag_pull");
         k_row_ag_fin<<<1, 32, 0, s>>>(a, p_.rank, p_.ngpu);
         KCHK("row_ag pull");
         return;
     } else {
-        k_row_ag<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, r0, r1, p_.rank, p_.ngpu, amask);
+        k_row_ag<<<dim3(p_.ngpu - 1, 16), 256, 0, s>>>(a, r0, r1, p_.rank, p_.ngpu, amask); CUDA_TRACE_LAUNCH("k_row_ag");
     }
     k_row_ag_wait<<<1, 32, 0, s>>>(a, p_.rank, p_.ngpu);
     KCHK("row_ag");
@@ -6046,8 +6046,8 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     ll_idx_ = 0;
     pfs_use_ = false;
     // the step counter (parity of the pending-row buffers): the bound slot's, or every segment's in its storage
-    if (pfm_) k_pf_bump<<<1, 32, 0, st_>>>(stepcs_, segslot_d_, pfm_nseg_);
-    else k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    if (pfm_) { k_pf_bump<<<1, 32, 0, st_>>>(stepcs_, segslot_d_, pfm_nseg_); CUDA_TRACE_LAUNCH("k_pf_bump"); }
+    else { k_step_bump<<<1, 1, 0, st_>>>(stepc_); CUDA_TRACE_LAUNCH("k_step_bump"); }
     tp0("step bump");
     if (trc0) {
         int mn = 1 << 30, mx = -1;
@@ -6144,13 +6144,13 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             __half* const xho = xhb + (size_t)o0 * H;
             if (nr > 0) {
                 hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, agq_x_, xho, nr, ps);
-                k_xh_to_x<<<64, 256, 0, ps>>>(xho, agq_x_, (size_t)nr * H / 2);
-                k_x_to_r8<<<nr, H / 16, 0, ps>>>(agq_x_, H, H, agq_r8_, agq_r8s_);
+                k_xh_to_x<<<64, 256, 0, ps>>>(xho, agq_x_, (size_t)nr * H / 2); CUDA_TRACE_LAUNCH("k_xh_to_x");
+                k_x_to_r8<<<nr, H / 16, 0, ps>>>(agq_x_, H, H, agq_r8_, agq_r8s_); CUDA_TRACE_LAUNCH("k_x_to_r8");
                 k_rows_q<<<dim3((nr + RQ_TB - 1) / RQ_TB, (ml->router8.n + RQ_NB - 1) / RQ_NB), 256, RQ_SMEM, ps>>>(
-                    ml->router8.q, ml->router8.s, H, ml->router8.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr);
-                k_topk_rows<<<nr, NE, 0, ps>>>(agq_rlog_, 1, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0, nullptr, nr);
+                    ml->router8.q, ml->router8.s, H, ml->router8.n, agq_r8_, agq_r8s_, agq_rlog_, 528, nr); CUDA_TRACE_LAUNCH("k_rows_q");
+                k_topk_rows<<<nr, NE, 0, ps>>>(agq_rlog_, 1, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0, nullptr, nr); CUDA_TRACE_LAUNCH("k_topk_rows");
                 int8_t* const xq = reinterpret_cast<int8_t*>(xho);
-                k_xh_to_q<64><<<nr, 160, 0, ps>>>(xho, xq, reinterpret_cast<float2*>(xq + H));
+                k_xh_to_q<64><<<nr, 160, 0, ps>>>(xho, xq, reinterpret_cast<float2*>(xq + H)); CUDA_TRACE_LAUNCH("k_xh_to_q");
                 k_agq_pack<<<nr, 160, 0, ps>>>(xho, gsel_ + (size_t)o0 * TOPK, gw_ + (size_t)o0 * TOPK, gsh_ + o0,
                                                  reinterpret_cast<char*>(xb) + (size_t)o0 * AGQ_ROWB);
                 KCHK("agq owner");
@@ -6164,7 +6164,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
             hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, xb + (size_t)o0 * H, xhb + (size_t)o0 * H, o1 - o0, ps);
             row_ag(2, o0, o1, ps, 0, rr);
-            k_xh_to_x<<<64, 256, 0, ps>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2);
+            k_xh_to_x<<<64, 256, 0, ps>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2); CUDA_TRACE_LAUNCH("k_xh_to_x");
         }
         CUDA_CHECK(cudaEventRecord(evd_[u], ps));
     };
@@ -6239,7 +6239,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             }
             row_ag(4, rr[2 * p_.rank], rr[2 * p_.rank + 1], s, ch, rr);
             xb_add(XB_MISC, (size_t)(rr[2 * p_.rank + 1] - rr[2 * p_.rank]) * RW * 4 * (p_.ngpu - 1));
-            k_copy_row<<<RW / 512, 512, 0, s>>>(mhR_ + (size_t)j * RW, Rb, nullptr, row);
+            k_copy_row<<<RW / 512, 512, 0, s>>>(mhR_ + (size_t)j * RW, Rb, nullptr, row); CUDA_TRACE_LAUNCH("k_copy_row");
         }
     };
     auto reset_rows = [&]() { at_rows(0); posd_ = posd0; curpos_ = posd_; };
@@ -6339,8 +6339,8 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             at_rows(off);
             if (!spm) hc_read(L.hcm, mc, true);
             if (p == 0 && pfs_use_) CUDA_CHECK(cudaStreamWaitEvent(st_, pfs_cp_[li & 1], 0));
-            if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), (size_t)mc * H / 2, dbgh_ + li * DBGK + 3);
-            if (rowh_) k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 0);
+            if (dbgh_) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), (size_t)mc * H / 2, dbgh_ + li * DBGK + 3); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
+            if (rowh_) { k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 0); CUDA_TRACE_LAUNCH("k_row_hash"); }
             // MoE input quantized + routed by the mixer collectives (agq_on_): the routing rows of this part
             const bool pre = spm && agq_on_ && L.router8.q;
             int* const gs0 = gsel_; float* const gw0 = gw_; float* const gh0 = gsh_;
@@ -6350,10 +6350,10 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             tpt("moe()");
             if (pre) { gsel_ = gs0; gw_ = gw0; gsh_ = gh0; moe_pre_ = false; }
             if (rowh_) {
-                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 1);
-                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), H, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 2);
-                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(gsel_), TOPK, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 3);
-                k_row_l1<<<mc, 256, 0, st_>>>(part_, H, mc, rowl1_ + (size_t)li * rowh_n_ + off);
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(xh_), H / 2, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 1); CUDA_TRACE_LAUNCH("k_row_hash");
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(part_), H, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 2); CUDA_TRACE_LAUNCH("k_row_hash");
+                k_row_hash<<<mc, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(gsel_), TOPK, mc, rowh_ + ((size_t)li * rowh_n_ + off) * 4, 3); CUDA_TRACE_LAUNCH("k_row_hash");
+                k_row_l1<<<mc, 256, 0, st_>>>(part_, H, mc, rowl1_ + (size_t)li * rowh_n_ + off); CUDA_TRACE_LAUNCH("k_row_l1");
             }
             CUDA_CHECK(cudaEventRecord(evp_[u0], st_));
             for (int u = u0; u < u1; u++) {
@@ -6382,7 +6382,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
                 for (int u = 0; u < nu; u++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[u], 0));
                 if (!trc_) { CUDA_CHECK(cudaHostAlloc((void**)&trc_, 64, cudaHostAllocMapped)); }
                 memset(trc_, 0, 64);
-                k_nancnt<<<256, 256, 0, st_>>>(Rb, (size_t)n * RW, trc_);
+                k_nancnt<<<256, 256, 0, st_>>>(Rb, (size_t)n * RW, trc_); CUDA_TRACE_LAUNCH("k_nancnt");
                 const cudaError_t e = cudaStreamSynchronize(st_);
                 if (e != cudaSuccess || trc_[0] || li == LAYERS - 1)
                     fprintf(stderr, "[pftrace] rank %d batch %d (n %d, pos %d) layer %d: %s, non-finite residual %u\n", p_.rank, tb, n,
@@ -6426,8 +6426,8 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     // MTP block as a 49th layer: residual rows from the trunk's own rows (in place), hca on own rows + gather on st_
     // (channel 1), its collectives on cst_ (channel 0), unit by unit as the trunk
     if (pfm_)
-        for (int j = 0; j < nend; j++) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, pf_end_[j], otok_ + j);
-    else if (mtpb_last_) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_);
+        for (int j = 0; j < nend; j++) { k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, pf_end_[j], otok_ + j); CUDA_TRACE_LAUNCH("j"); }
+    else if (mtpb_last_) { k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_); CUDA_TRACE_LAUNCH("k_set_last_tok"); }
     xb_base_ = 8;
     struct XbBase { int& b; ~XbBase() { b = 0; } } xbb{xb_base_};
     // [qfn-mtp-1row] a batch whose MTP block feeds no draft (not the prompt's last batch; several prompts: no prompt end
@@ -6445,7 +6445,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         const int o0 = rows_k(u, p_.rank), o1 = rows_k(u, p_.rank + 1), nr = o1 - o0;
         if (nr > 0) {
             float* const Ro = Rb + (size_t)o0 * RW;
-            k_mtp_prep<<<dim3(nr, HC + 1), 256, 0, st_>>>(embed_, mtok_ + o0, Ro, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_);
+            k_mtp_prep<<<dim3(nr, HC + 1), 256, 0, st_>>>(embed_, mtok_ + o0, Ro, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_); CUDA_TRACE_LAUNCH("k_mtp_prep");
             rows8(mtp_fce_, mtp_en_, H, mtp_fe_, H, nr, st_);
             rows8(mtp_fch_, mtp_hn_, H, mtp_fh_, H, nr * HC, st_);
             k_mtp_comb<<<nr, 512, 0, st_>>>(mtp_fe_, mtp_fh_, Ro);
@@ -6456,7 +6456,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_k(u, g), rr[2 * g + 1] = rows_k(u, g + 1);
         row_ag(2, o0, o1, st_, 1, rr);
         xb_add(XB_AG_MIXIN, (size_t)nr * H * 2 * (p_.ngpu - 1));
-        k_xh_to_x<<<64, 256, 0, st_>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2);
+        k_xh_to_x<<<64, 256, 0, st_>>>(xhb + (size_t)off * H, xb + (size_t)off * H, (size_t)mc * H / 2); CUDA_TRACE_LAUNCH("k_xh_to_x");
         for (int c = cb[u]; c < cb[u + 1]; c++) {
             const int coff = chunk_off(c, n), cm = std::min(chunk_off(c + 1, n), nk) - coff;
             if (cm <= 0) continue;  // (one: a last chunk of only the last row)
@@ -6490,7 +6490,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         const int cl = cb[nu] - 1, coff = chunk_off(cl, n);
         int* const mpos0 = mposd_;
         float* const rs0 = Rsave_;
-        k_setpos<<<1, 1, 0, st_>>>(mpos0, cposd_ + 2 * cl, n - 1 - coff);
+        k_setpos<<<1, 1, 0, st_>>>(mpos0, cposd_ + 2 * cl, n - 1 - coff); CUDA_TRACE_LAUNCH("k_setpos");
         posd_ = cposd_ + 2 * cl;
         sel_on_ = (selmask >> cl) & 1;
         Rsave_ = Rb + (size_t)(n - 1) * RW;
@@ -6541,7 +6541,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
         return;
     }
     last_row_R(st_, 1);
-    k_copy_row<<<RW / 512, 512, 0, st_>>>(Rmin_, Rb, nullptr, n - 1);  // the draft chain continues from the last row
+    k_copy_row<<<RW / 512, 512, 0, st_>>>(Rmin_, Rb, nullptr, n - 1); CUDA_TRACE_LAUNCH("k_copy_row");  // the draft chain continues from the last row
     x_ = xb + (size_t)(n - 1) * H;
     xh_ = xhb + (size_t)(n - 1) * H;
     R_ = Rb + (size_t)(n - 1) * RW;
@@ -6559,9 +6559,9 @@ void Worker::trunk_batch(int n, unsigned selmask) {
     struct Stage {
         Worker* w;
         explicit Stage(Worker* x) : w(x) {
-            if (!w->xout_) return;
-            k_xpar_align<<<1, 1, 0, w->st_>>>(w->xseq_, w->xqseq_);
-            if (w->xouti_) k_xpar_align<<<1, 1, 0, w->st_>>>(w->xiseq_, w->xiseq_);
+            if (!w->xout_) { return;
+            k_xpar_align<<<1, 1, 0, w->st_>>>(w->xseq_, w->xqseq_); CUDA_TRACE_LAUNCH("k_xpar_align"); }
+            if (w->xouti_) { k_xpar_align<<<1, 1, 0, w->st_>>>(w->xiseq_, w->xiseq_); CUDA_TRACE_LAUNCH("k_xpar_align"); }
             w->xstage_ = true;
             w->xq_k_ = w->xc_k_ = w->xi_k_ = 0;
             w->xce_rec_[0] = w->xce_rec_[1] = false;
@@ -6578,7 +6578,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
     static const bool ov = (env_int("FLASH_AROV", 1)) && !g_kchk;  // FLASH_AROV=0: same stream
     ll_idx_ = 0;
     pfs_use_ = false;  // staged cold groups only in the overlapped multi-chunk path below (it issues the copies)
-    k_step_bump<<<1, 1, 0, st_>>>(stepc_);
+    k_step_bump<<<1, 1, 0, st_>>>(stepc_); CUDA_TRACE_LAUNCH("k_step_bump");
     float* const Rb = R_;
     bf16* const plerb = pler_;
     int* const posd0 = posd_;
@@ -6612,16 +6612,16 @@ void Worker::trunk_batch(int n, unsigned selmask) {
             const int off = c * PFM, mc = std::min(PFM, n - off);
             CUDA_CHECK(cudaStreamWaitEvent(cst_, after, 0));
             static const int sc = env_int("FLASH_AROV_SPINC", 0);  // debug: lag the comm stream (ns)
-            if (sc) k_spin<<<1, 1, 0, cst_>>>(sc);
+            if (sc) { k_spin<<<1, 1, 0, cst_>>>(sc); CUDA_TRACE_LAUNCH("k_spin"); }
             static const bool fused = env_int("FLASH_ARHC", 1);  // residual update in the AR tail
             static const int ovb = env_int("QE_AR_OV_BLOCKS", 8);  // fused tail: 8 (sweep 4 / 8 / 12 / 16)
             if (p_.ngpu == 1) {  // 1-rank pipeline stage: the update straight from the partial (k_hc_write clears it)
-                k_hc_write<<<mc, 512, 0, cst_>>>(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H);
+                k_hc_write<<<mc, 512, 0, cst_>>>(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H); CUDA_TRACE_LAUNCH("k_hc_write");
             } else if (!(fused && allreduce_add_hc(Rb + (size_t)off * RW, injb + (size_t)off * HC, partb + (size_t)off * H, mc, H, comm_,
                                             p_.rank, ctr_, cst_, fast ? 64 : ovb))) {
                 allreduce_add(yb + (size_t)off * H, partb + (size_t)off * H, mc, H, comm_, p_.rank, ctr_, cst_, nullptr, 0.f,
                               nullptr, -1, !fast);
-                k_hc_write<<<mc, 512, 0, cst_>>>(Rb + (size_t)off * RW, injb + (size_t)off * HC, yb + (size_t)off * H);
+                k_hc_write<<<mc, 512, 0, cst_>>>(Rb + (size_t)off * RW, injb + (size_t)off * HC, yb + (size_t)off * H); CUDA_TRACE_LAUNCH("k_hc_write");
             }
             steer(sli, mc, nullptr, cst_, Rb + (size_t)off * RW, nullptr, nullptr);  // layer output of the chunk's rows
             CUDA_CHECK(cudaEventRecord(evd_[c], cst_));
@@ -6641,7 +6641,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
                 if (li > p_.l0) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // MoE piece c of the previous layer
                 else if (pp_hov_ && !p_.first()) CUDA_CHECK(cudaStreamWaitEvent(st_, hev_in_[c], 0));  // its input rows
                 static const int sm = env_int("FLASH_AROV_SPINM", 0);  // debug: lag compute
-                if (sm && ((li * 7 + c * 3 + p_.rank) % 5 == 0)) k_spin<<<1, 1, 0, st_>>>(sm);
+                if (sm && ((li * 7 + c * 3 + p_.rank) % 5 == 0)) { k_spin<<<1, 1, 0, st_>>>(sm); CUDA_TRACE_LAUNCH("k_spin"); }
                 posd_ = cposd_ + 2 * c;
                 curpos_ = posd_;
                 sel_on_ = (selmask >> c) & 1;
@@ -6664,10 +6664,10 @@ void Worker::trunk_batch(int n, unsigned selmask) {
             posd_ = posd0;
             curpos_ = posd_;
             for (int c = 0; c < nch; c++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));
-            if (nfl_d_) k_nf_rows<<<64, 256, 0, st_>>>(Rb, (size_t)n * RW, nfl_d_ + li);  // (after the layer's mixer)
-            if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(Rb), (size_t)n * RW, dbgh_ + li * DBGK);
+            if (nfl_d_) { k_nf_rows<<<64, 256, 0, st_>>>(Rb, (size_t)n * RW, nfl_d_ + li); CUDA_TRACE_LAUNCH("k_nf_rows"); }  // (after the layer's mixer)
+            if (dbgh_) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(Rb), (size_t)n * RW, dbgh_ + li * DBGK); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
             hc_read(L.hcm, n, true);
-            if (dbgh_) k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(x_), (size_t)n * H / 2, dbgh_ + li * DBGK + 3);
+            if (dbgh_) { k_dbg_hash<<<64, 256, 0, st_>>>(reinterpret_cast<const unsigned*>(x_), (size_t)n * H / 2, dbgh_ + li * DBGK + 3); CUDA_TRACE_LAUNCH("k_dbg_hash"); }
             if (pfs_use_) CUDA_CHECK(cudaStreamWaitEvent(st_, pfs_cp_[li & 1], 0));
             moe(L, n);
             if (pfs_use_ && li + 2 < p_.l1) {  // ring half li & 1 is free again: layer li + 2 goes there
@@ -6711,17 +6711,17 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         R_ = Rb;
         if (sampling_) head_sample(1, otok_);
         else head(1, otok_);
-        if (mtpb_last_) k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_);
+        if (mtpb_last_) { k_set_last_tok<<<1, 1, 0, st_>>>(mtok_, n, otok_); CUDA_TRACE_LAUNCH("k_set_last_tok"); }
         for (int c = 0; c < nch; c++) {
             const int off = c * PFM, mc = std::min(PFM, n - off);
             posd_ = cposd_ + 2 * c;
             curpos_ = posd_;
             sel_on_ = (selmask >> c) & 1;
             float* const Rc = Rb + (size_t)off * RW;
-            k_mtp_prep<<<dim3(mc, HC + 1), 256, 0, st_>>>(embed_, mtok_ + off, Rc, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_);
+            k_mtp_prep<<<dim3(mc, HC + 1), 256, 0, st_>>>(embed_, mtok_ + off, Rc, mtp_pre_e_, mtp_pre_h_, mtp_en_, mtp_hn_); CUDA_TRACE_LAUNCH("k_mtp_prep");
             rows8(mtp_fce_, mtp_en_, H, mtp_fe_, H, mc, st_);
             rows8(mtp_fch_, mtp_hn_, H, mtp_fh_, H, mc * HC, st_);
-            k_mtp_comb<<<mc, 512, 0, st_>>>(mtp_fe_, mtp_fh_, Rc);  // MTP residual rows in place
+            k_mtp_comb<<<mc, 512, 0, st_>>>(mtp_fe_, mtp_fh_, Rc); CUDA_TRACE_LAUNCH("k_mtp_comb");  // MTP residual rows in place
             KCHK("mtp prep");
             R_ = Rc;
             inj_ = injb + (size_t)off * HC;
@@ -6744,7 +6744,7 @@ void Worker::trunk_batch(int n, unsigned selmask) {
         for (int c = 0; c < nch; c++) ar_chunk(c, evm_, false);
         for (int c = 0; c < nch; c++) CUDA_CHECK(cudaStreamWaitEvent(st_, evd_[c], 0));  // join
         ypend_ = false;
-        k_copy_row<<<RW / 512, 512, 0, st_>>>(Rmin_, Rb, nullptr, n - 1);  // the draft chain continues from the last row
+        k_copy_row<<<RW / 512, 512, 0, st_>>>(Rmin_, Rb, nullptr, n - 1); CUDA_TRACE_LAUNCH("k_copy_row");  // the draft chain continues from the last row
         R_ = Rb + (size_t)(n - 1) * RW;
         hc_read(mtp_mixer_, 1, false);
         R_ = Rb;
@@ -7378,21 +7378,21 @@ void Worker::prefill_mtp(const int* mtp_toks, int pos, int m, int* draft) {
 void Worker::spec_body(int k, bool lookup, int kd) {
     const int m = k + 1;
     comm_begin_unit(ctr_, st_);
-    if (lookup) k_vtok_lk<<<1, 32, 0, st_>>>(vtok_, lk_, k);  // drafts of the previous step's lookup
+    if (lookup) { k_vtok_lk<<<1, 32, 0, st_>>>(vtok_, lk_, k); CUDA_TRACE_LAUNCH("k_vtok_lk"); }  // drafts of the previous step's lookup
     if (ngp_.flags) {  // staged rows (table not pinned): ids -> host -> rows
         NgramDev g = ngp_;
         g.phase = 1;
-        k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, g, pler_);
-        k_ngram_handoff<<<1, 32, 0, st_>>>(g, m * PLE_HEADS);
+        k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, g, pler_); CUDA_TRACE_LAUNCH("k_ngram");
+        k_ngram_handoff<<<1, 32, 0, st_>>>(g, m * PLE_HEADS); CUDA_TRACE_LAUNCH("k_ngram_handoff");
         g.phase = 2;
-        k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, g, pler_);
-    } else
-    k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, ngp_, pler_);
+        k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, g, pler_); CUDA_TRACE_LAUNCH("k_ngram");
+    } else{ 
+    k_ngram<<<m, 256, 0, st_>>>(vtok_, hist2_, ngp_, pler_); CUDA_TRACE_LAUNCH("k_ngram"); }
     KCHK("k_ngram");
     vchain_ = true;  // verify rows (penalty: row i continues the sampled rows < i)
     trunk(m, vtok_);
     vchain_ = false;
-    k_accept<<<1, 32, 0, st_>>>(vtok_, otok_, k, posd_, mposd_, acc_, hist2_, em_);  // otok_: argmax or sampled rows
+    k_accept<<<1, 32, 0, st_>>>(vtok_, otok_, k, posd_, mposd_, acc_, hist2_, em_); CUDA_TRACE_LAUNCH("k_accept");  // otok_: argmax or sampled rows
     KCHK("k_accept");
     if (sampling_) pen_commit(sp_, em_, posd_, st_);  // the emitted tokens end at the new position
     // [qfn-mtp-conf] MTP steps: the chain runs while the running product of the draft head's p(top-1) stays >= tau,
@@ -7400,14 +7400,14 @@ void Worker::spec_body(int k, bool lookup, int kd) {
     const bool conf = conf_last_ && !lookup && kd < 0;  // (conf_last_: set by spec_launch for this launch)
     conf_head_ = conf;
     mtp_core(m, false, otok_, motok_, acc_);
-    k_draft0<<<1, 32, 0, st_>>>(motok_, acc_, dr_);
+    k_draft0<<<1, 32, 0, st_>>>(motok_, acc_, dr_); CUDA_TRACE_LAUNCH("k_draft0");
     if (conf) {
-        k_conf0<<<1, 32, 0, st_>>>(dconf_, acc_, cprod_, cgo_, em_, conf_tau_, conf_kmin_, conf_kmax_);
+        k_conf0<<<1, 32, 0, st_>>>(dconf_, acc_, cprod_, cgo_, em_, conf_tau_, conf_kmin_, conf_kmax_); CUDA_TRACE_LAUNCH("k_conf0");
         for (int j = 1; j < conf_kmax_; j++)
             cond_if(cgo_, [&] {
-                k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1);
+                k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1); CUDA_TRACE_LAUNCH("k_setpos");
                 mtp_core(1, true, dr_ + j - 1, dr_ + j, nullptr);
-                k_conf_upd<<<1, 32, 0, st_>>>(dconf_, cprod_, cgo_, em_, conf_tau_, j, conf_kmin_, conf_kmax_);
+                k_conf_upd<<<1, 32, 0, st_>>>(dconf_, cprod_, cgo_, em_, conf_tau_, j, conf_kmin_, conf_kmax_); CUDA_TRACE_LAUNCH("k_conf_upd");
             });
         conf_head_ = false;
         k_next_conf<<<1, 32, 0, st_>>>(vtok_, otok_, acc_, dr_, em_);
@@ -7417,14 +7417,14 @@ void Worker::spec_body(int k, bool lookup, int kd) {
     // lookup steps: no MTP draft chain (the fill's draft is enough for a k=1 step); constrained: kd drafts
     const int kc = lookup ? 1 : kd >= 0 ? kd : k;
     for (int j = 1; j < kc; j++) {
-        k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1);
+        k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1); CUDA_TRACE_LAUNCH("k_setpos");
         mtp_core(1, true, dr_ + j - 1, dr_ + j, nullptr);
     }
     k_next<<<1, 32, 0, st_>>>(vtok_, otok_, acc_, dr_, kc, em_);
     KCHK("k_next");
     }
     if (lk_on_ && kd < 0) {  // lookup drafts for the next step (history += this step's tokens)
-        k_hist_add<<<1, 32, 0, st_>>>(hd_, hn_d_, em_, lkrg_);
+        k_hist_add<<<1, 32, 0, st_>>>(hd_, hn_d_, em_, lkrg_); CUDA_TRACE_LAUNCH("k_hist_add");
         lk_scan_emit();
         KCHK("lookup");
         if (lookup && lk_kfull_ > 1) lk_chain();
@@ -7450,7 +7450,7 @@ void Worker::cond_if(const int* flag, const std::function<void()>& body) {
     CUDA_CHECK(cudaStreamGetCaptureInfo(st_, &cs, nullptr, &g, nullptr, nullptr, nullptr));
     cudaGraphConditionalHandle h;
     CUDA_CHECK(cudaGraphConditionalHandleCreate(&h, g, 0, 0));
-    k_conf_cond<<<1, 32, 0, st_>>>(h, flag);
+    k_conf_cond<<<1, 32, 0, st_>>>(h, flag); CUDA_TRACE_LAUNCH("k_conf_cond");
     CUDA_CHECK(cudaStreamGetCaptureInfo(st_, &cs, nullptr, &g, &deps, nullptr, &nd));
     cudaGraphNodeParams cp = {};
     cp.type = cudaGraphNodeTypeConditional;
@@ -7483,7 +7483,7 @@ void Worker::cond_if(const int* flag, const std::function<void()>& body) {
 void Worker::lk_chain() {
     auto chain = [&]() {
         for (int j = 1; j < lk_kfull_; j++) {
-            k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1);
+            k_setpos<<<1, 1, 0, st_>>>(mposd_, posd_, j - 1); CUDA_TRACE_LAUNCH("k_setpos");
             mtp_core(1, true, dr_ + j - 1, dr_ + j, nullptr);
         }
         k_next<<<1, 32, 0, st_>>>(vtok_, otok_, acc_, dr_, lk_kfull_, em_);
@@ -7502,7 +7502,7 @@ void Worker::lk_chain() {
     CUDA_CHECK(cudaStreamGetCaptureInfo(st_, &cs, nullptr, &g, nullptr, nullptr, nullptr));
     cudaGraphConditionalHandle h;
     CUDA_CHECK(cudaGraphConditionalHandleCreate(&h, g, 0, 0));
-    k_lk_cond<<<1, 32, 0, st_>>>(h, lk_);
+    k_lk_cond<<<1, 32, 0, st_>>>(h, lk_); CUDA_TRACE_LAUNCH("k_lk_cond");
     CUDA_CHECK(cudaStreamGetCaptureInfo(st_, &cs, nullptr, &g, &deps, nullptr, &nd));
     cudaGraphNodeParams cp = {};
     cp.type = cudaGraphNodeTypeConditional;
@@ -7627,12 +7627,12 @@ __global__ void k_lk_agree(const float* __restrict__ all, int n, int ngpu, int* 
     if (__any_sync(0xffffffffu, d) && i == 0) atomicAdd(diff, 1u);
 }
 void Worker::lk_scan_emit() {
-    k_lk_scan<<<(max_ctx_ + 255) / 256, 256, 0, st_>>>(hd_, hn_d_, lkbest_);
+    k_lk_scan<<<(max_ctx_ + 255) / 256, 256, 0, st_>>>(hd_, hn_d_, lkbest_); CUDA_TRACE_LAUNCH("k_lk_scan");
     // FLASH_CORPUS_MIN: shortest corpus match used (default 12)
     static const int cmin = env_int("FLASH_CORPUS_MIN", 12);
-    if (cd_) k_lk_scan_c<<<std::min(1024, (ccap_ + 255) / 256), 256, 0, st_>>>(cd_, cn_d_, hd_, hn_d_, lkbestc_);
+    if (cd_) { { k_lk_scan_c<<<std::min(1024, (ccap_ + 255) / 256), 256, 0, st_>>>(cd_, cn_d_, hd_, hn_d_, lkbestc_); CUDA_TRACE_LAUNCH("k_lk_scan_c"); }
     k_lk_emit<<<1, 32, 0, st_>>>(hd_, hn_d_, lkbest_, lk_mmin_, lk_llo_, lk_hi_, lk_lmax_, lk_, em_ + MAXM + 2, lkrg_, lkrp_,
-                                 cd_, lkbestc_, cmin);
+                                 cd_, lkbestc_, cmin); CUDA_TRACE_LAUNCH("k_lk_emit"); }
     // one lookup result on every rank (decode hang seen in testing): the step graph branches on lk_[0] on each device (k_lk_cond:
     // the MTP draft chain, whose collectives every rank must enter) and k_vtok_lk builds the next verify rows from
     // lk_[1..]; a rank whose lookup differed (e.g. a corpus update landing between ranks) skipped the chain while the
@@ -7644,7 +7644,7 @@ void Worker::lk_scan_emit() {
             *lkdiff_ = 0;
         }
         allgather_small(reinterpret_cast<const float*>(lk_), kLkWords, lkall_, comm_, p_.rank, ctr_, st_);
-        k_lk_agree<<<1, 32, 0, st_>>>(lkall_, kLkWords, p_.ngpu, lk_, lkdiff_);
+        k_lk_agree<<<1, 32, 0, st_>>>(lkall_, kLkWords, p_.ngpu, lk_, lkdiff_); CUDA_TRACE_LAUNCH("k_lk_agree");
     }
 }
 
@@ -7812,8 +7812,8 @@ int Worker::spec_finish(int* emitted) {
 // fails the sequences of those rows (flash_capi.cpp: the request gets an error, its conversation is dropped, the
 // server goes on), 2: log only (debugging), 3: abort the process (the old behaviour), 0: off.
 void Worker::nf_layer(int li, int m) {
-    if (!nfl_d_ || m <= 0) return;
-    k_nf_rows<<<64, 256, 0, st_>>>(R_, (size_t)m * RW, nfl_d_ + (li < 0 ? LAYERS : li));
+    if (!nfl_d_ || m <= 0) { return;
+    k_nf_rows<<<64, 256, 0, st_>>>(R_, (size_t)m * RW, nfl_d_ + (li < 0 ? LAYERS : li)); CUDA_TRACE_LAUNCH("k_nf_rows"); }
 }
 unsigned Worker::nf_check(const char* what, int pos) {
     if (!nf_h_) return 0;
@@ -7955,7 +7955,7 @@ static void pp_link_emul(size_t bytes, cudaStream_t st) {
     static const double gbps = env_double("FLASH_TEST_LINK_GBPS", 0.0), real = env_double("FLASH_PP_REAL_GBPS", 24.0);
     if (gbps <= 0 || !bytes) return;
     const double ns = bytes / gbps - (real > 0 ? bytes / real : 0.0);
-    if (ns > 1000) k_pp_spin<<<1, 1, 0, st>>>((unsigned long long)ns);
+    if (ns > 1000) { k_pp_spin<<<1, 1, 0, st>>>((unsigned long long)ns); CUDA_TRACE_LAUNCH("k_pp_spin"); }
 }
 bool Worker::pp_hop16() {
     static const bool on = env_int("FLASH_PP_HOP16", 0) != 0;
@@ -7996,7 +7996,7 @@ void Worker::hop_in(float* dst, const char* src, int rows, cudaStream_t s) {
             CUDA_CHECK(cudaMemcpyAsync(d, src, bytes, cudaMemcpyDefault, s));
             w = d;
         }
-        k_pp_unpack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(w, dst, (size_t)rows * RW);
+        k_pp_unpack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(w, dst, (size_t)rows * RW); CUDA_TRACE_LAUNCH("k_pp_unpack16");
     } else {
         CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s));
     }
@@ -8010,7 +8010,7 @@ void Worker::hop_out(const float* src, size_t off, int rows, cudaStream_t s) {
     if (pp_hop16()) {
         const size_t wo = (size_t)(src - (pp_hov_ ? pfb_.R : src)) / RW;
         bf16* w = pp_wire_out_ + wo * RW;
-        k_pp_pack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(src, w, (size_t)rows * RW);
+        k_pp_pack16<<<std::min<size_t>(1024, ((size_t)rows * RW + 255) / 256), 256, 0, s>>>(src, w, (size_t)rows * RW); CUDA_TRACE_LAUNCH("k_pp_pack16");
         from = w;
     }
     for (int o = 0; o <= pp_nxo_; o++) {
@@ -8063,8 +8063,8 @@ void Worker::kvs_set_pe(int pe) {
     for (int li = 0; li <= LAYERS; li++) {
         Layer& L = li < LAYERS ? L_[li] : mtp_;
         if (li == LAYERS && !has_mtp_) break;
-        if (!L.kvp.ctl) continue;
-        k_kv_trim<<<std::max(1, std::min(64, (kvs_P_ - pe + 255) / 256)), 256, 0, st_>>>(L.kvp, pe);
+        if (!L.kvp.ctl) { continue;
+        k_kv_trim<<<std::max(1, std::min(64, (kvs_P_ - pe + 255) / 256)), 256, 0, st_>>>(L.kvp, pe); CUDA_TRACE_LAUNCH("k_kv_trim"); }
     }
     kvs_pe_ = pe;
     // block-cache entries in use (the rest is lent to the expert cache): logged on large changes (>= P / 8)
@@ -8206,8 +8206,8 @@ void Worker::kv_inval(int base, int t0, int t1) {
     for (int li = 0; li <= LAYERS; li++) {
         Layer& L = li < LAYERS ? L_[li] : mtp_;
         if (li == LAYERS && !has_mtp_) break;
-        if (!L.kvp.ctl) continue;
-        k_kv_inval<<<std::min(256, (b1 - b0 + 255) / 256), 256, 0, st_>>>(L.kvp, b0, b1);
+        if (!L.kvp.ctl) { continue;
+        k_kv_inval<<<std::min(256, (b1 - b0 + 255) / 256), 256, 0, st_>>>(L.kvp, b0, b1); CUDA_TRACE_LAUNCH("k_kv_inval"); }
     }
 }
 

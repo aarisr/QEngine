@@ -22,7 +22,7 @@ void qe_fatal_begin();
 #define CUDA_CHECK(x)                                                \
     do {                                                             \
         cudaError_t err__ = (x);                                     \
-        if (err__ != cudaSuccess) qe_fatal_cuda(err__, __FILE__, __LINE__); \
+        qe_cuda_check(err__, #x, __FILE__, __LINE__);                 \
     } while (0)
 
 #define CHECK(cond, ...)                                                       \
@@ -41,6 +41,35 @@ typedef __nv_bfloat16 bf16;
 // cached): lets one process A/B prefill variants by changing the environment between prompts
 //. Only for host code outside the hot decode path.
 #include "env.h"
+inline bool qe_cuda_trace_enabled() {
+    static const bool enabled = env_int("FLASH_CUDA_TRACE", 0) != 0;
+    return enabled;
+}
+[[noreturn]] inline void qe_cuda_trace_fail(cudaError_t err, const char* op, const char* file, int line) {
+    fprintf(stderr, "[qflash] CUDA first failure after %s at %s:%d: %s\n", op, file, line, cudaGetErrorString(err));
+    fflush(stderr);
+    qe_fatal_cuda(err, file, line);
+}
+inline void qe_cuda_trace_check(cudaError_t err, const char* op, const char* file, int line) {
+    if (!qe_cuda_trace_enabled()) return;
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) qe_cuda_trace_fail(err, op, file, line);
+}
+inline void qe_cuda_check(cudaError_t err, const char* op, const char* file, int line) {
+    if (err != cudaSuccess) {
+        if (qe_cuda_trace_enabled()) qe_cuda_trace_fail(err, op, file, line);
+        qe_fatal_cuda(err, file, line);
+    }
+    qe_cuda_trace_check(cudaSuccess, op, file, line);
+}
+inline void qe_cuda_trace_launch(const char* op, const char* file, int line) {
+    if (!qe_cuda_trace_enabled()) return;
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) qe_cuda_trace_fail(err, op, file, line);
+}
+#define CUDA_TRACE_LAUNCH(op) qe_cuda_trace_launch((op), __FILE__, __LINE__)
+#define CUDA_TRACE_OP(err, op) qe_cuda_trace_check((err), (op), __FILE__, __LINE__)
 typedef __nv_bfloat162 bf162;
 
 // Max tokens processed by the tensor-core GEMV path (decode + MTP verification).
