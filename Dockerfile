@@ -20,6 +20,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU} AS build
 ARG CUDA_ARCHS="86;89;120"
 # the build's git hash for the start-up log (the build context has no .git): --build-arg REVISION=$(git rev-parse HEAD)
 ARG REVISION=unknown
+ARG CMAKE_BUILD_PARALLEL_LEVEL=8
 RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -29,7 +30,7 @@ COPY src ./src
 # GCC 13 (supported by nvcc 13.1) is used
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" \
       "-DQE_GIT_HASH=${REVISION}" \
-    && cmake --build build
+    && cmake --build build --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}"
 # DeepSeek-V4.1-Flash engine (libqdsv4.so; src/dsv4/build.sh, distro GCC 13, sm_86 code): built when the source tree
 # has it; the library lands in /src/dsv4out (empty otherwise) so the runtime stage can copy the directory either way
 RUN mkdir -p /src/dsv4out \
