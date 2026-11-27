@@ -3526,6 +3526,12 @@ class Job:
                 if not promoted:  # (the next turn renders a </think> the tokens don't have: not a changed reply)
                     self.gen.remember(self.affinity, self.ids, keep_out)
                 self.gen.remember_turn(self.ids, keep_out)
+            if (not self.cancelled() and not getattr(self, "client_gone", False) and
+                    not getattr(self, "shut", False) and
+                    "qe_snapshot_reply_end" in getattr(self.gen.engine, "fns", ())):
+                t_snap = time.perf_counter()
+                if self.gen.engine.snapshot_reply_end(self.slot):
+                    self.gen.metrics.reply_end_snapshot(time.perf_counter() - t_snap)
             self.done.set()
             self.gen.engine.release(self.slot)
             if getattr(self, "client_gone", False):

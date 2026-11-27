@@ -73,6 +73,7 @@ SIGS = {
     "qe_archive_more": (c_int, [c_void_p, c_i64]),
     "qe_persist": (None, [c_void_p]),
     "qe_num_archives": (c_int, [c_void_p]),
+<<<<<<< HEAD
     "qe_archive_flush": (c_i64, [c_void_p, c_i64]),
     "qe_archive_flush_tier": (c_i64, [c_void_p, c_i64, c_int]),
     "qe_set_session": (None, [c_void_p, ctypes.c_uint64, c_i64]),
@@ -81,6 +82,10 @@ SIGS = {
     "qe_num_tiers": (c_int, [c_void_p]),
     "qe_tier_info": (c_int, [c_void_p, c_int, P_double]),
     "qe_tier_name": (ctypes.c_char_p, [c_void_p, c_int]),
+||||||| parent of 64708e4 (feat(qengine): snapshot DeltaNet state at reply end)
+=======
+    "qe_snapshot_reply_end": (c_int, [c_void_p, c_int]),
+>>>>>>> 64708e4 (feat(qengine): snapshot DeltaNet state at reply end)
     "qe_num_disk_archives": (c_int, [c_void_p]),
     "qe_disk_flush": (c_int, [c_void_p, ctypes.c_double]),
     "qe_last_copied": (c_int, [c_void_p]),
@@ -674,6 +679,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
                 out.append({"tier": self.lib.qe_tier_name(self.h, i).decode(), "bytes": buf[0], "objects": int(buf[1]),
                             "evictions": int(buf[2]), "cap": buf[3]})
         return out
+    def snapshot_reply_end(self, slot):
+        """Save the Qwen3.8-27B DeltaNet state at this completed reply's end."""
+        return bool(self.lib.qe_snapshot_reply_end(self.h, int(slot))) if "qe_snapshot_reply_end" in self.fns else False
+
 
     def disk_flush(self, seconds):
         """Flash-Next: persist() only queues the files; wait for them, at most `seconds`. True: all written."""

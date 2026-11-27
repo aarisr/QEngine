@@ -349,6 +349,7 @@ long long qe_archive_flush(void* e, long long max_bytes) {
     return max_bytes > 0 ? (long long)((Engine*)e)->flush_archives((size_t)max_bytes) : 0;
 }
 void qe_set_dump_hidden(void* e, uint16_t* out) { ((Engine*)e)->set_dump_hidden(out); }
+int qe_snapshot_reply_end(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->snapshot_reply_end(slot); }
 void qe_release(void* e, int slot) { QE_STEP_CALL; ((Engine*)e)->release(slot); }
 // [srv-disconnect] the client of the slot's prompt in flight left: the release that follows keeps the rows done
 void qe_prefill_cancel(void* e, int slot) { ((Engine*)e)->prefill_cancel(slot); }

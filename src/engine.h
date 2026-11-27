@@ -184,6 +184,7 @@ public:
     bool last_from_archive() const { return last_from_archive_; }
     int num_archives() const { return archives_.size(); }
     int num_disk_archives() const;
+    bool snapshot_reply_end(int slot);
     // Archive every live slot (and write the configured store) during shutdown.
     void persist();
     // Persist the hottest archived checkpoints first, up to `max_bytes`, to the writable tiers: tier < 0 fills the
@@ -567,7 +568,7 @@ private:
     // [kb-q27-imgtab] grow the table to cap rows (the first keep rows copied): false when the pin fails (nothing changed)
     bool grow_img_table(size_t cap, size_t keep);
     size_t img_range(int img_rows, size_t* keep) const;  // the first gap of img_rows rows the prefills in flight leave
-    void take_snapshot(const int* ids, int pos, int kind = 0, int replace = 0);
+    bool take_snapshot(const int* ids, int pos, int kind = 0, int replace = 0);
     void demote_spent(const PrefillState& pf, int pos);  // [q27-snap-demote]
     void snap_host_wait();  // [q27-snapasync] every card's snapshot copy in flight is in its host buffer
     std::vector<Snapshot> snaps_;

@@ -18,7 +18,8 @@ from qe_env import env_int
 
 COUNTERS = ("requests", "errors", "prompt_tokens", "cached_tokens", "prefill_tokens", "prefill_s",
             "gen_tokens", "decode_s", "steps", "seq_steps", "images", "image_tokens", "energy_j",
-            "uptime_s", "spec_steps", "spec_drafted", "spec_accepted", "think_tokens")
+            "uptime_s", "spec_steps", "spec_drafted", "spec_accepted", "think_tokens",
+            "reply_end_snapshots", "reply_end_snapshot_s")
 
 
 class Metrics:
@@ -171,6 +172,13 @@ class Metrics:
         if tokens:
             with self.lock:
                 self.session["think_tokens"] += int(tokens)
+
+
+    def reply_end_snapshot(self, seconds):
+        """Record one successful Qwen3.8-27B reply-end snapshot and its synchronous scheduling time."""
+        with self.lock:
+            self.session["reply_end_snapshots"] += 1
+            self.session["reply_end_snapshot_s"] += max(float(seconds), 0.0)
 
     def reset_session(self):
         """Dashboard "reset": the session's counters move into the global totals (nothing is lost
@@ -377,6 +385,14 @@ class Metrics:
         m("prefill_tokens_total", se["prefill_tokens"], "prompt tokens computed", "counter")
         m("requests_total", se["requests"], "requests since start", "counter")
         m("thinking_tokens_total", se["think_tokens"], "reasoning tokens generated (requests under the think-budget controller)", "counter")
+        m("reply_end_snapshots_total", se["reply_end_snapshots"],
+          "Qwen3.8-27B reply-end DeltaNet snapshots saved", "counter")
+        m("reply_end_snapshot_seconds_total", round(se["reply_end_snapshot_s"], 6),
+          "Cumulative synchronous time spent scheduling reply-end snapshots", "counter")
+        count = se["reply_end_snapshots"]
+        m("reply_end_snapshot_seconds_per_snapshot",
+          round(se["reply_end_snapshot_s"] / count, 6) if count else 0,
+          "Mean synchronous time to schedule one reply-end snapshot")
         m("spec_verify_steps_total", se["spec_steps"], "speculative verify steps (accepted + steps = tokens emitted)", "counter")
         m("spec_drafted_tokens_total", se["spec_drafted"], "draft tokens verified (MTP and lookup)", "counter")
         m("spec_accepted_tokens_total", se["spec_accepted"], "draft tokens the model accepted (MTP and lookup)", "counter")

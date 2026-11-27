@@ -33,4 +33,14 @@ m.sample_gpus(501.0)
 assert calls["n"] == n0 + 2                                      # busy and older than 5 s: reads
 m.sample_gpus(503.0)
 assert calls["n"] == n0 + 2                                      # busy within ttl: cached
+
+m.jobs.pop(1, None)
+m.reply_end_snapshot(0.125)
+snap = m.snapshot(sample=False)["session"]
+assert snap["reply_end_snapshots"] == 1
+assert abs(snap["reply_end_snapshot_s"] - 0.125) < 1e-9
+prom = m.prometheus()
+assert "qengine_reply_end_snapshots_total 1" in prom
+assert "qengine_reply_end_snapshot_seconds_total 0.125" in prom
+assert "qengine_reply_end_snapshot_seconds_per_snapshot 0.125" in prom
 print("test_metrics_nvml_gate ok")

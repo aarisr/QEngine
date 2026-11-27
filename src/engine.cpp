@@ -3906,13 +3906,13 @@ void Engine::set_no_lookup(int slot, bool off) {
     if (slot >= 0 && slot < (int)seqs_.size()) seqs_[slot].no_lookup = off;
 }
 
-void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
+bool Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
     const long long sk = seqs_[cur_].sk;  // the state's steering key: the slot's conversation's
     for (auto& s : snaps_)
         if (s.slot == cur_ && s.sk == sk && s.pos == pos && std::equal(s.toks.begin(), s.toks.end(), ids)) {
             s.used = ++tick_;
             s.kind = std::max(s.kind, kind);
-            return;
+            return true;
         }
     Snapshot* s = nullptr;
     // a long prompt's rolling checkpoints: overwrite its own oldest one (position `replace`)
@@ -3968,7 +3968,7 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
         }
     }
     if (!s) {  // evict: LRU of the kind at or over its quota (snap_policy.h)
-        if (snaps_.empty()) return;  // (a store held at 0 by a failed pin: no state saved)
+        if (snaps_.empty()) return false;  // (a store held at 0 by a failed pin: no state saved)
         s = &snaps_[snap_victim(snaps_, kind, snap_reserve0_, [&](const Snapshot& x) {
             const bool ok = x.slot >= 0 && x.slot < (int)seqs_.size();
             const int end = ok ? std::max(seqs_[x.slot].pos, x.slot == cur_ && pf_of(cur_) ? pf_of(cur_)->n : 0) : 0;
@@ -3987,6 +3987,24 @@ void Engine::take_snapshot(const int* ids, int pos, int kind, int replace) {
         if (async) workers_[r]->snapshot_save_async(s->bufs[r]);
         else workers_[r]->snapshot_save(s->bufs[r]);
     });
+    return true;
+}
+
+bool Engine::snapshot_reply_end(int slot) {
+    static const bool enabled = env_int("QE_REPLY_END_SNAPSHOT", 1) != 0;
+    if (!enabled || slot < 0 || slot >= (int)seqs_.size()) return false;
+    Seq& q = seqs_[slot];
+    if (!q.active || q.paused || pf_of(slot) || q.pos <= 0 || q.seq.size() < (size_t)q.pos) return false;
+
+    const int keep = cur_;
+    finish_for(slot);
+    if (slot != cur_) use_slot(slot);
+    if (mkv_slot_ == slot) mkv_catch_up();
+    if (q.stale) resync(q, slot);
+    const bool saved = !q.stale && !pf_of(slot) && q.pos > 0 && q.seq.size() >= (size_t)q.pos &&
+                       take_snapshot(q.seq.data(), q.pos, 1);
+    if (cur_ != keep) use_slot(keep);
+    return saved;
 }
 
 // [q27-snap-demote] a new prompt-end state of a slot: the slot's older prompt-end states that are prefixes of this prompt
