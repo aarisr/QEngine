@@ -1,6 +1,8 @@
 // Microbench hooks for experiments (not used by the engine): an AR-latency stand-in
 // (one block spinning on the global timer) and L2 prefetch variants of the next GEMV's weights.
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -182,5 +184,89 @@ extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) {
                 }
     }
     for (void* p : bufs) cudaFree(p);
+    return h;
+}
+
+// ---- multi-row INT4 GEMV bit-identity check and timing: pseudo-random packed weights, scales and XH
+// activations at (n, k, m), run through the production dispatch gemv_w4h (gemv_x_init first, so the tile-pair
+// and wide kernels are reachable). Returns an FNV-1a hash of y (m x n fp32 bits); *us gets the mean time of
+// `iters` back-to-back launches with the weights cycled over a 256 MiB pool so each launch reads from DRAM.
+namespace {
+__global__ void fill_u32_kernel(uint32_t* p, size_t n, uint32_t seed) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
+        x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+        p[i] = x;
+    }
+}
+__global__ void fill_half_kernel(__half* p, size_t n, uint32_t seed) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
+        x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+        p[i] = __float2half(((int)(x % 2001) - 1000) * 0.001f);
+    }
+}
+}  // namespace
+
+extern "C" unsigned long long qe_check_gemv(int n, int k, int m, int iters, float* us) {
+    gemv_x_init();
+    const size_t wbytes = (size_t)n * k / 2;
+    const size_t sb = (size_t)(n / 16) * (k / 128) * 16 * 2;  // bf16 [tile][group][16]
+    const int ldx = (k + 63) / 64 * 64;
+    const int copies = (int)std::max<size_t>(1, ((size_t)256 << 20) / wbytes);
+    uint8_t *q, *s; __half* xh; float* y;
+    CUDA_CHECK(cudaMalloc(&q, wbytes * copies)); CUDA_CHECK(cudaMalloc(&s, sb * copies));
+    CUDA_CHECK(cudaMalloc(&xh, (size_t)m * ldx * 2 + 256)); CUDA_CHECK(cudaMalloc(&y, (size_t)m * n * 4));
+    fill_u32_kernel<<<1024, 256>>>((uint32_t*)q, wbytes * copies / 4, 99u);
+    fill_half_kernel<<<256, 256>>>((__half*)s, sb * copies / 2, 5u);   // scale bits: bf16 of small magnitude after the cast below
+    fill_half_kernel<<<256, 256>>>(xh, (size_t)m * ldx, 31u);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    // scales must be sane bf16: map the fp16 values to bf16 in place (|v| <= 1)
+    {
+        std::vector<__half> hs(sb * copies / 2);
+        CUDA_CHECK(cudaMemcpy(hs.data(), s, sb * copies, cudaMemcpyDeviceToHost));
+        std::vector<bf16> bs(hs.size());
+        for (size_t i = 0; i < hs.size(); i++) bs[i] = __float2bfloat16(0.01f * __half2float(hs[i]));
+        CUDA_CHECK(cudaMemcpy(s, bs.data(), sb * copies, cudaMemcpyHostToDevice));
+    }
+    cudaStream_t st; CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    auto run = [&](int c) {
+        W4 w{(const uint4*)(q + wbytes * c), (const bf16*)(s + sb * c), n, k, false};
+        gemv_w4h(w, xh, ldx, y, n, m, st);
+    };
+    run(0);
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    std::vector<float> hy((size_t)m * n);
+    CUDA_CHECK(cudaMemcpy(hy.data(), y, hy.size() * 4, cudaMemcpyDeviceToHost));
+    unsigned long long h = 1469598103934665603ull;
+    for (float f : hy) { uint32_t b; memcpy(&b, &f, 4); for (int x = 0; x < 4; x++) h = (h ^ ((b >> (8 * x)) & 255)) * 1099511628211ull; }
+    if (iters > 0) {
+        // 20 launches per graph (host launch cost is not what is measured), `iters` launches in all
+        cudaGraph_t gr; cudaGraphExec_t ge;
+        CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        for (int i = 0; i < 20; i++) run(i % copies);
+        CUDA_CHECK(cudaStreamEndCapture(st, &gr));
+        CUDA_CHECK(cudaGraphInstantiate(&ge, gr, 0));
+        const int reps = std::max(1, iters / 20);
+        // warm-up until the clocks have ramped (the card idles in P5 between runs), then the best of 5 timed passes
+        for (int i = 0; i < 4000; i++) {  // ~2 s of load: the memory clock follows the load with a delay
+            CUDA_CHECK(cudaGraphLaunch(ge, st));
+            if (i % 64 == 63) CUDA_CHECK(cudaStreamSynchronize(st));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+        float best = 1e30f;
+        for (int pass = 0; pass < 5; pass++) {
+            cudaEventRecord(e0, st);
+            for (int i = 0; i < reps; i++) CUDA_CHECK(cudaGraphLaunch(ge, st));
+            cudaEventRecord(e1, st); cudaEventSynchronize(e1);
+            float ms; cudaEventElapsedTime(&ms, e0, e1);
+            best = std::min(best, ms * 1000.f / (reps * 20));
+        }
+        if (us) *us = best;
+        cudaGraphExecDestroy(ge); cudaGraphDestroy(gr);
+    }
+    cudaStreamDestroy(st);
+    cudaFree(q); cudaFree(s); cudaFree(xh); cudaFree(y);
     return h;
 }
