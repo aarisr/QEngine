@@ -335,6 +335,15 @@ int qe_last_copied(void* e) { return ((Engine*)e)->last_copied(); }
 int qe_last_from_archive(void* e) { return ((Engine*)e)->last_from_archive(); }
 int qe_num_archives(void* e) { return ((Engine*)e)->num_archives(); }
 int qe_num_disk_archives(void* e) { return ((Engine*)e)->num_disk_archives(); }
+long long qe_archive_flush_tier(void* e, long long max_bytes, int tier) {
+    return max_bytes > 0 ? (long long)((Engine*)e)->flush_archives((size_t)max_bytes, tier) : 0;
+}
+void qe_set_session(void* e, unsigned long long session, long long ttl_s) { ((Engine*)e)->set_session(session, ttl_s); }
+long long qe_archive_delete_session(void* e, unsigned long long session) { return (long long)((Engine*)e)->delete_session(session); }
+int qe_archive_gc(void* e) { return ((Engine*)e)->archive_gc(); }
+int qe_num_tiers(void* e) { return ((Engine*)e)->num_tiers(); }
+const char* qe_tier_name(void* e, int i) { return ((Engine*)e)->tier_name(i); }
+int qe_tier_info(void* e, int i, double* out) { return ((Engine*)e)->tier_info(i, out) ? 1 : 0; }
 void qe_persist(void* e) { ((Engine*)e)->persist(); }
 long long qe_archive_flush(void* e, long long max_bytes) {
     return max_bytes > 0 ? (long long)((Engine*)e)->flush_archives((size_t)max_bytes) : 0;

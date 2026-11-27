@@ -16,6 +16,7 @@ if not os.environ.get("OPENBLAS_NUM_THREADS", "").strip():
 import argparse
 import array
 import hashlib
+import hmac
 import asyncio
 import collections
 import ctypes
@@ -981,6 +982,17 @@ def session_hash_of(headers_get):
     /api/stats recent[] entry then carry no session, as before the header existed)."""
     v = headers_get("x-session-hash")
     return v if v and SESSION_HASH.match(v) else None
+
+
+def cache_ttl_of(headers_get):
+    """The x-cache-ttl header (class short / default / long, case-insensitive; anything else is "default") as seconds,
+    mapped by QE_CACHE_TTL_SHORT_S / QE_CACHE_TTL_DEFAULT_S / QE_CACHE_TTL_LONG_S and capped at QE_CACHE_MAX_AGE_S. The
+    engine drops the session's archives once it runs out (TTL expiry)."""
+    cls = (headers_get("x-cache-ttl") or "default").strip().lower()
+    cap = env_int("QE_CACHE_MAX_AGE_S", 7 * 24 * 3600)
+    secs = {"short": env_int("QE_CACHE_TTL_SHORT_S", 3600), "default": env_int("QE_CACHE_TTL_DEFAULT_S", 24 * 3600),
+            "long": env_int("QE_CACHE_TTL_LONG_S", 7 * 24 * 3600)}
+    return min(secs.get(cls, secs["default"]), cap)
 
 
 class Admission:
@@ -2130,6 +2142,7 @@ class Generator:
                              f"{max(self.engine.slots)}")
         job = Job(self, ids, p, on_text, cancelled, affinity, cls)
         job.session = session_hash_of(req.headers.get) if req is not None else None
+        job.cache_ttl_s = cache_ttl_of(req.headers.get) if req is not None else cache_ttl_of(lambda _: None)
         img = getattr(ids, "img", (0, 0))
         self.metrics.queued(job, getattr(ids, "label", "") or "chat", img[0], img[1])
         with self.cv:
@@ -2846,6 +2859,7 @@ class Job:
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
         self.cls = cls
+        self.cache_ttl_s = 0  # the request's x-cache-ttl class in seconds (cache_ttl_of)
         self.session = None  # the request's x-session-hash header (session_hash_of): the [chat] line and /api/stats recent[]
         self.lp = p.get("logprobs")
         self.grammar, self.grammar_s, self.gsteps = None, 0.0, 0  # structured output (begin_start)
@@ -2883,6 +2897,8 @@ class Job:
         self.t0 = time.time()
         g.metrics.prefill_start(self)
         e.set_steering(*p.get("steering_sel", STEER_DEFAULT))  # this request's steering (keys the cached prefixes)
+        if hasattr(e, "set_session"):  # the archive's identity (x-session-hash) and TTL class: set before the start tags its slot
+            e.set_session(self.session, self.cache_ttl_s)
         self.slot = e.start_begin(self.ids, g.args.mtp_k, self.affinity, g.system_end(self.ids),
                                   getattr(self.ids, "mm", None))
         flag = getattr(self.cancelled, "flag", None)
@@ -4219,6 +4235,20 @@ def build_app(gen: Generator, args):
     async def health():
         return {"status": "ok"}
 
+    def archive_store_ready():
+        return not args.profile.is_flash and bool(args.disk_cache or env_str("QE_CACHE_RAM_DIR") or env_str("QE_CACHE_NVME_DIR"))
+
+    def admin_denied(req):
+        """Fail closed: without QE_ADMIN_TOKEN the route is refused (403); with it, the bearer token must match
+        (constant-time compare). The token is never logged."""
+        tok = env_str("QE_ADMIN_TOKEN")
+        if not tok:
+            return JSONResponse({"error": "QE_ADMIN_TOKEN is not set: session delete is disabled"}, status_code=403)
+        got = req.headers.get("authorization", "")
+        if not hmac.compare_digest(got.encode(), f"Bearer {tok}".encode()):
+            return JSONResponse({"error": "admin token required"}, status_code=401)
+        return None
+
     @app.post("/admin/archive/flush")
     async def flush_archive(req: Request):
         if args.profile.is_flash:
@@ -4226,24 +4256,49 @@ def build_app(gen: Generator, args):
         client = req.client
         if not client or client.host not in ("127.0.0.1", "::1"):
             return JSONResponse({"error": "loopback only"}, status_code=403)
-        if not args.disk_cache:
+        if not archive_store_ready():
             return JSONResponse({"error": "no persistent archive directory is configured"}, status_code=503)
         try:
             body = await req.json()
         except Exception:
             return JSONResponse({"error": "expected a JSON body"}, status_code=400)
-        if not isinstance(body, dict) or body.get("directory") != args.disk_cache:
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "expected a JSON object"}, status_code=400)
+        if "directory" in body and body["directory"] != args.disk_cache:  # (legacy single-directory form)
             return JSONResponse({"error": "directory must match the configured --disk-cache path"}, status_code=400)
         max_bytes = body.get("max_bytes")
-        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 0 < max_bytes <= (128 << 30):
-            return JSONResponse({"error": "max_bytes must be an integer in 1..137438953472"}, status_code=400)
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 0 < max_bytes <= (1 << 40):
+            return JSONResponse({"error": "max_bytes must be an integer in 1..1099511627776"}, status_code=400)
+        which = body.get("tier", "all")
+        if which not in ("all", "ram", "nvme"):
+            return JSONResponse({"error": "tier must be all, ram or nvme"}, status_code=400)
         result = {}
 
         def flush():
-            result["bytes"] = gen.engine.flush_archives(max_bytes)
+            t = -1 if which == "all" else gen.engine.tier_index(which)
+            result["bytes"] = 0 if (t < 0 and which != "all") else gen.engine.flush_archives(max_bytes, t)
 
         await asyncio.to_thread(gen.run_on_engine, flush)
-        return {"directory": args.disk_cache, "written_bytes": result.get("bytes", 0)}
+        return {"tier": which, "written_bytes": result.get("bytes", 0), "tiers": gen.engine.tier_stats()}
+
+    @app.delete("/api/cache/session/{session_hash}")
+    async def delete_cache_session(session_hash: str, req: Request):
+        """The scheduler calls it when a lane ends: drops the session's archives (memory and files) on this arm."""
+        if args.profile.is_flash:
+            return JSONResponse({"error": "archive delete is Qwen3.8-27B only"}, status_code=404)
+        if (denied := admin_denied(req)) is not None:
+            return denied
+        if not SESSION_HASH.match(session_hash):
+            return JSONResponse({"error": "session hash must be 1-32 lowercase hex characters"}, status_code=400)
+        if not archive_store_ready():
+            return JSONResponse({"error": "no persistent archive directory is configured"}, status_code=503)
+        result = {}
+
+        def delete():
+            result["bytes"] = gen.engine.delete_session(session_hash)
+
+        await asyncio.to_thread(gen.run_on_engine, delete)
+        return {"session": session_hash, "freed_bytes": int(result.get("bytes", 0))}
 
     def limits():
         """What a client needs to size its requests (vLLM / llama.cpp field names where they exist)."""
@@ -5203,6 +5258,8 @@ def parse_args(argv=None):
         import assets  # 27B INT8 checkpoints keep their own head unless QE_INT8_MTP_FT=1 (Flash-Next's D2 has INT8 groups too: unchanged)
         if args.profile.is_flash or assets.use_mtp_ft(args.model):
             os.environ["QE_MTP_FILE"] = ft
+    if not args.disk_cache and not args.profile.is_flash:  # tiered store (QE_CACHE_RAM_DIR / QE_CACHE_NVME_DIR) alone enables it
+        args.disk_cache = env_str("QE_CACHE_RAM_DIR") or env_str("QE_CACHE_NVME_DIR") or ""
     if args.disk_cache:  # (also the directory of the start-up cache, comm_cache.h: on Flash-Next too)
         os.environ["QE_DISK_CACHE"] = args.disk_cache
         os.environ["QE_DISK_CACHE_GB"] = str(args.disk_cache_gb)

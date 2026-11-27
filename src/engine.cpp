@@ -1676,7 +1676,8 @@ void Engine::archive_info(double* out) const {
     out[0] = out[1] = out[2] = out[3] = 0;
     out[4] = hpool_.pinned_bytes();
     out[5] = hpool_.used_bytes();
-    out[6] = disk_evictions_.load(std::memory_order_relaxed);
+    out[6] = 0;
+    for (int t = 0; t < store_.tiers(); t++) out[6] += store_.tier(t).evictions;
     for (auto& a : archives_) {
         if (a.ram) out[0] += 1, out[1] += a.total;
         if (!a.path.empty()) out[2] += 1, out[3] += a.file_bytes();
@@ -1928,7 +1929,8 @@ void Engine::reset() {  // forget every cached prefix (slots and snapshots)
     snaps_.clear();
     snap_n_ = 0;
     archives_.clear();  // disk files stay (forgotten until the next start)
-    archive_used_ = disk_used_ = prefix_used_ = 0;
+    archive_used_ = prefix_used_ = 0;
+    store_.reset_objects();
 }
 
 static int lcp_of(const std::vector<int>& a, const int* ids, int n) {
@@ -2019,9 +2021,12 @@ uint64_t arch_hdr_hash(int32_t n, const std::vector<int>& subs, const int* toks)
     b.insert(b.end(), (const char*)toks, (const char*)toks + (size_t)n * 4);
     return arch_hash(b.data(), b.size());
 }
-uint64_t arch_hdr_hash_v4(int32_t n, long long sk, const std::vector<int>& subs, const int* toks) {
+uint64_t arch_hdr_hash_v4(int32_t n, long long sk, int64_t session, int64_t expires, const std::vector<int>& subs,
+                          const int* toks) {
     std::vector<char> b;
     put(b, (int64_t)sk);
+    put(b, session);
+    put(b, expires);
     put(b, n);
     for (int p : subs) put(b, (int32_t)p);
     b.insert(b.end(), (const char*)toks, (const char*)toks + (size_t)n * 4);
@@ -2372,8 +2377,7 @@ void Engine::disk_forget(KvArchive& a) {
         a.disk->cv.notify_all();
         disk_cv_.notify_all();  // (disk_wait_idle)
     }
-    disk_used_ -= a.file_bytes();
-    disk_evictions_.fetch_add(1, std::memory_order_relaxed);
+    store_.remove(a.path, true);
     a.path.clear();
     a.disk.reset();
     a.fsizes.clear();
@@ -2610,15 +2614,12 @@ bool Engine::ram_make_room(size_t need, int prio, size_t limit) {
     return true;
 }
 
-bool Engine::disk_make_room(size_t need) {
-    auto used = [&] {
-        const size_t max = std::numeric_limits<size_t>::max();
-        return disk_used_ > max - disk_covered_ ? max : disk_used_ + disk_covered_;
-    };
-    while (!qe_archive_store::fits(disk_budget_, used(), need)) {
+bool Engine::disk_make_room(int tier, size_t need) {
+    while (!store_.fits(tier, need, disk_covered_)) {  // (superseded files not yet deleted count)
         auto lru = archives_.end();
         for (auto it = archives_.begin(); it != archives_.end(); ++it)
-            if (!it->disk_readonly && !it->path.empty() && !it->hold && (lru == archives_.end() || it->used < lru->used)) lru = it;
+            if (it->tier == tier && !it->disk_readonly && !it->path.empty() && !it->hold &&
+                (lru == archives_.end() || it->used < lru->used)) lru = it;
         if (lru == archives_.end()) return false;
         if (lru->ram) disk_forget(*lru);
         else drop_archive(lru);
@@ -2657,7 +2658,7 @@ void Engine::drop_covered(long long sk, const int* toks, int n, unsigned long lo
                 if (c == qe_disk::Cover::CARRY) {
                     const size_t fb = it->file_bytes();
                     covered_files_.push_back({it->path, fb});
-                    disk_used_ -= fb;
+                    store_.remove(it->path, false);
                     disk_covered_ += fb;  // (rereview M1 / L2: still on the drive until deleted)
                     it->path.clear();
                     it->fsizes.clear();
@@ -2845,6 +2846,7 @@ void Engine::archive_slot(int slot, bool force) {
     std::vector<ArchSub> subs = arch_nosubs_ ? std::vector<ArchSub>{} : archive_subs(q, n);  // (park: the end state only)
     KvArchive a;
     a.sk = q.sk;
+    a.session = q.session, a.expires = q.expires;
     a.split = q.split;  // rows [0, split) stay with the shared prefix (named by the tokens)
     for (int r = 0; r < ng; r++) {
         a.sizes.push_back(workers_[r]->archive_bytes(a.split, n) + subs.size() * workers_[r]->snapshot_bytes());
@@ -2907,6 +2909,7 @@ bool Engine::bg_prepare(int slot) {
     b.born = tick_;
     KvArchive& a = b.a;
     a.sk = q.sk;
+    a.session = q.session, a.expires = q.expires;
     a.split = q.split;
     for (int r = 0; r < ng; r++) {
         a.sizes.push_back(workers_[r]->archive_bytes(a.split, n) + subs.size() * workers_[r]->snapshot_bytes());
@@ -2964,6 +2967,7 @@ void Engine::bg_finish(bool all) {
 
 bool Engine::archive_more(size_t budget) {
     mem_pressure();  // (the server archives while idle without calling mem_guard: the policy is stepped here too)
+    if (!disk_dir_.empty() && (long long)time(nullptr) - last_gc_s_ >= 60) archive_gc();  // TTL classes, once a minute
     // host memory pressure: no new optional copy (one already prepared goes on: its memory is taken); the C API says
     // "not now" (2) so the server asks again after the pressure (qe_archive_more)
     if (qe_memp::holding() && bg_.slot < 0) return true;
@@ -3162,39 +3166,37 @@ bool Engine::eager_full() {
     return qe_disk::full(live, eager_cap_);
 }
 
-void Engine::disk_enqueue(KvArchive& a) {
+void Engine::disk_enqueue(KvArchive& a, int tier) {
     FilePlan fp;
-    if (!file_plan(a, fp)) return;
+    if (tier < 0 || tier >= store_.tiers() || !file_plan(a, fp)) return;
     if (eager_full()) {  // [disk-eager review M3] the queue cap (persist() writes the skipped ones)
         a.disk_skip = true;
         if (pool_log_) printf("disk cache: eager queue full (%zu), %d tokens not written until the persist\n", eager_cap_, a.n), fflush(stdout);
         return;
     }
     a.disk_skip = false;
-    if (disk_dir_.rfind("/dev/shm/", 0) != 0) {
-        struct statvfs fs{};
-        const size_t max = std::numeric_limits<size_t>::max();
-        if (statvfs(disk_dir_.c_str(), &fs) != 0 ||
-            (fs.f_frsize && (fs.f_blocks > max / fs.f_frsize || fs.f_bavail > max / fs.f_frsize)) ||
-            !qe_archive_store::below_usage_limit((size_t)fs.f_blocks * fs.f_frsize,
-                                                 (size_t)fs.f_bavail * fs.f_frsize, fp.total)) {
-            a.disk_skip = true;
-            return;  // avoid pushing the NVMe filesystem above 85% used
-        }
+    if (!store_.floor_ok(tier, fp.total)) {
+        a.disk_skip = true;
+        return;  // avoid pushing the NVMe filesystem above its usage floor
     }
-    if (!disk_make_room(fp.total)) {
+    if (!disk_make_room(tier, fp.total)) {
         a.disk_skip = true;
         return;  // hard cap: never queue a write that cannot fit after evicting eligible local entries
     }
-    char name[96];
+    char name[128];
     const unsigned long long token_key = (unsigned long long)fnv64(a.toks.data(), a.n);
-    if (a.sk >= 0)
-        snprintf(name, sizeof name, "/%016llx_%d_s%016llx.qkv", token_key, a.n, (unsigned long long)a.sk);
-    else
-        snprintf(name, sizeof name, "/%016llx_%d.qkv", token_key, a.n);
-    a.path = disk_dir_ + name;
+    size_t at = snprintf(name, sizeof name, "/%016llx_%d", token_key, a.n);
+    if (a.sk >= 0) at += snprintf(name + at, sizeof name - at, "_s%016llx", (unsigned long long)a.sk);
+    if (a.session) at += snprintf(name + at, sizeof name - at, "_u%016llx", a.session);
+    snprintf(name + at, sizeof name - at, ".qkv");
+    a.path = store_.tier(tier).dir + name;
+    a.tier = tier;
     a.disk = std::make_shared<DiskState>();
-    disk_used_ += fp.total;
+    {
+        qe_archive_store::Obj o;
+        o.tier = tier, o.bytes = fp.total, o.session = a.session, o.expires = a.expires;
+        store_.add(a.path, o);
+    }
     DiskJob j;
     j.ram = a.ram;
     j.sizes = fp.sizes;
@@ -3222,6 +3224,8 @@ void Engine::disk_enqueue(KvArchive& a) {
     h.insert(h.end(), fingerprint_.begin(), fingerprint_.end());
     put(h, (int32_t)a.n);
     put(h, (int64_t)a.sk);
+    put(h, (int64_t)a.session);
+    put(h, (int64_t)a.expires);
     put(h, (uint32_t)fp.subs.size());
     put(h, (uint32_t)fp.sizes.size());
     for (size_t sz : fp.sizes) put(h, (uint64_t)sz);
@@ -3232,7 +3236,7 @@ void Engine::disk_enqueue(KvArchive& a) {
     h.resize(h.size() + (size_t)nh * 8, 0);
     j.ns = (int)fp.subs.size();
     for (auto& w : workers_) j.snb.push_back(w->snapshot_bytes());
-    put(h, arch_hdr_hash_v4(a.n, a.sk, fp.subs, a.toks.data()));
+    put(h, arch_hdr_hash_v4(a.n, a.sk, (int64_t)a.session, (int64_t)a.expires, fp.subs, a.toks.data()));
     const char* t = (const char*)a.toks.data();
     h.insert(h.end(), t, t + (size_t)a.n * 4);
     a.data_off = h.size();
@@ -3341,7 +3345,7 @@ void Engine::disk_writer() {
             if (w && !j.st->cancel) w = rename(tmp.c_str(), j.path.c_str()) == 0;
             else w = false;
             if (w) {  // (review L9) the rename on the drive before drop_carried unlinks the superseded file
-                const int dfd = open(disk_dir_.c_str(), O_RDONLY | O_DIRECTORY);
+                const int dfd = open(j.path.substr(0, j.path.rfind('/')).c_str(), O_RDONLY | O_DIRECTORY);
                 if (dfd >= 0) {
                     fsync(dfd);
                     close(dfd);
@@ -3438,9 +3442,13 @@ bool Engine::archive_load(KvArchive& a) {
 // Disk cache setup: identity of the model / split (archives of another configuration are
 // ignored), index of the existing files (LRU order by modification time), writer thread.
 void Engine::disk_init() {
-    const char* d = env_str("QE_DISK_CACHE");
-    if (!d || !*d) return;
-    disk_dir_ = d;
+    // Writable tiers, restore order = declaration order: QE_CACHE_RAM_DIR (/dev/shm) then QE_CACHE_NVME_DIR; with neither
+    // set the single legacy QE_DISK_CACHE directory is the one tier (RAM when under /dev/shm).
+    const char* ram_d = env_str("QE_CACHE_RAM_DIR");
+    const char* nvme_d = env_str("QE_CACHE_NVME_DIR");
+    const char* legacy_d = env_str("QE_DISK_CACHE");
+    const bool have_ram = ram_d && *ram_d, have_nvme = nvme_d && *nvme_d;
+    if (!have_ram && !have_nvme && (!legacy_d || !*legacy_d)) return;
     const size_t gib = (size_t)1 << 30;
     size_t kv_pool = 0;
     for (auto& w : workers_) {
@@ -3448,9 +3456,23 @@ void Engine::disk_init() {
         kv_pool = bytes > std::numeric_limits<size_t>::max() - kv_pool
                       ? std::numeric_limits<size_t>::max() : kv_pool + bytes;
     }
-    const bool ram_store = disk_dir_.rfind("/dev/shm/", 0) == 0;
-    disk_budget_ = ram_store ? 16 * gib : qe_archive_store::nvme_cap(kv_pool, archive_budget_, prefix_budget_);
-    mkdir(disk_dir_.c_str(), 0755);
+    const size_t nvme_computed = qe_archive_store::nvme_cap(kv_pool, archive_budget_, prefix_budget_);
+    auto cap_of = [&](const char* knob, bool ram) {
+        const double g = env_double(knob, 0.0);
+        return g > 0 ? (size_t)(g * gib) : ram ? 16 * gib : nvme_computed;
+    };
+    const unsigned nvme_pct = (unsigned)std::min(100, std::max(1, env_int("QE_CACHE_NVME_MAX_PCT", 85)));
+    if (have_ram) store_.add_tier("ram", ram_d, true, cap_of("QE_CACHE_RAM_GB", true));
+    if (have_nvme) store_.add_tier("nvme", nvme_d, false, cap_of("QE_CACHE_NVME_GB", false), nvme_pct);
+    if (!have_ram && !have_nvme) {
+        const bool ram = std::string(legacy_d).rfind("/dev/shm/", 0) == 0;
+        store_.add_tier(ram ? "ram" : "nvme", legacy_d, ram, cap_of("QE_DISK_CACHE_GB", ram), nvme_pct);
+    }
+    disk_dir_ = store_.tier(0).dir;
+    for (int t = 0; t < store_.tiers(); t++) {
+        mkdir(store_.tier(t).dir.c_str(), 0755);
+        disk_budget_ = std::max(disk_budget_, store_.tier(t).cap);
+    }
     std::ostringstream fp;
     char rp[PATH_MAX];
     // v4: archives written before the KV-pool compaction fix (23781c9) may hold overwritten rows
@@ -3490,29 +3512,32 @@ void Engine::disk_init() {
     if (disk_eager_) printf("disk cache: eager (--disk-eager): every conversation is written once archived after a reply\n");
 
     struct Found { KvArchive a; time_t mt; bool read_only; };
+    const int64_t max_age = std::max(1, env_int("QE_CACHE_MAX_AGE_S", 7 * 24 * 60 * 60));
     std::vector<Found> found;
-    std::vector<std::pair<std::string, bool>> scan_dirs = {{disk_dir_, false}};
+    struct ScanDir { std::string dir; bool read_only; int tier; };
+    std::vector<ScanDir> scan_dirs;
+    for (int t = 0; t < store_.tiers(); t++) scan_dirs.push_back({store_.tier(t).dir, false, t});
     if (const char* dirs = env_str("QE_DISK_CACHE_READ_DIRS"); dirs && *dirs) {
         const std::string paths = dirs;
         for (size_t at = 0; at <= paths.size();) {
             const size_t end = paths.find(';', at);
             const std::string path = paths.substr(at, end == std::string::npos ? end : end - at);
-            if (!path.empty() && path != disk_dir_) {
-                scan_dirs.emplace_back(path, true);
-            }
+            bool own = false;
+            for (int t = 0; t < store_.tiers(); t++) own = own || store_.tier(t).dir == path;
+            if (!path.empty() && !own) scan_dirs.push_back({path, true, 0});
             if (end == std::string::npos) break;
             at = end + 1;
         }
     }
-    // Restore RAM archives before NVMe archives even when the writable directory is configured as the disk tier.
-    std::stable_sort(scan_dirs.begin(), scan_dirs.end(), [](const auto& a, const auto& b) {
-        return a.first.rfind("/dev/shm/", 0) == 0 && b.first.rfind("/dev/shm/", 0) != 0;
+    // Restore RAM before NVMe, own tiers before sibling directories.
+    std::stable_sort(scan_dirs.begin(), scan_dirs.end(), [](const ScanDir& a, const ScanDir& b) {
+        const bool ar = a.dir.rfind("/dev/shm/", 0) == 0, br = b.dir.rfind("/dev/shm/", 0) == 0;
+        return a.read_only != b.read_only ? !a.read_only : ar && !br;
     });
     std::set<std::string> seen_files;
     size_t peer_archives = 0, peer_bytes = 0;
     const time_t now = time(nullptr);
-    constexpr time_t kMaxArchiveAge = 7 * 24 * 60 * 60;
-    for (const auto& [scan_dir, read_only] : scan_dirs) {
+    for (const auto& [scan_dir, read_only, scan_tier] : scan_dirs) {
         DIR* dir = opendir(scan_dir.c_str());
         if (!dir) {
             if (read_only) fprintf(stderr, "RAM archive store: peer directory unavailable: %s\n", scan_dir.c_str());
@@ -3527,7 +3552,7 @@ void Engine::disk_init() {
                 continue;
             }
             if (nm.size() < 5 || nm.compare(nm.size() - 4, 4, ".qkv") != 0 || seen_files.count(nm)) continue;
-            if (now > ent.st_mtime && now - ent.st_mtime > kMaxArchiveAge) {
+            if (now > ent.st_mtime && now - ent.st_mtime > max_age) {
                 if (!read_only) unlink(path.c_str());
                 continue;
             }
@@ -3551,7 +3576,10 @@ void Engine::disk_init() {
                 std::string fps(fl, '\0');
                 if (fread(&fps[0], 1, fl, f) != fl || fps != fingerprint_) break;
                 if (fread(&n, 4, 1, f) != 1 || n <= 0) break;
-                if (v4 && fread(&a.sk, 8, 1, f) != 1) break;
+                int64_t sess = 0, expires = 0;
+                if (v4 && (fread(&a.sk, 8, 1, f) != 1 || fread(&sess, 8, 1, f) != 1 || fread(&expires, 8, 1, f) != 1)) break;
+                a.session = (unsigned long long)sess, a.expires = expires;
+                if (expires > 0 && expires <= now) break;  // TTL ran out while stopped: dropped (own files unlinked below)
                 if (fread(&ns, 4, 1, f) != 1 || ns > kMaxSubs) break;
                 a.subs.resize(ns);
                 if (ns && fread(a.subs.data(), 4, ns, f) != ns) break;
@@ -3576,7 +3604,7 @@ void Engine::disk_init() {
                 }
                 a.toks.resize(n);
                 if (fread(a.toks.data(), 4, n, f) != (size_t)n) break;
-                if ((v4 && arch_hdr_hash_v4(n, a.sk, a.subs, a.toks.data()) != hh) ||
+                if ((v4 && arch_hdr_hash_v4(n, a.sk, sess, expires, a.subs, a.toks.data()) != hh) ||
                     (v3 && arch_hdr_hash(n, a.subs, a.toks.data()) != hh)) {
                     fprintf(stderr, "RAM archive store: header checksum mismatch, skipped: %s\n", path.c_str());
                     break;
@@ -3588,6 +3616,7 @@ void Engine::disk_init() {
                     (size_t)stt.st_size != (size_t)a.data_off + a.total) break;
                 a.path = path;
                 a.disk_readonly = read_only;
+                a.tier = scan_tier;
                 a.disk = std::make_shared<DiskState>();
                 a.disk->done = a.disk->ok = true;
                 a.disk->hash = std::move(hs);
@@ -3608,31 +3637,38 @@ void Engine::disk_init() {
             peer_archives++;
             peer_bytes += fa.a.total;
         } else {
-            disk_used_ += fa.a.total;
+            qe_archive_store::Obj o;
+            o.tier = fa.a.tier, o.bytes = fa.a.total, o.session = fa.a.session, o.expires = fa.a.expires;
+            store_.add(fa.a.path, o);
             own_archives++;
         }
         archives_.push_back(std::move(fa.a));
     }
-    disk_make_room(0);
-    const char* kind = disk_dir_.rfind("/dev/shm/", 0) == 0 ? "RAM archive store" : "disk cache";
-    printf("%s %s: local %zu archives, %.1f GiB; sibling %zu archives, %.1f GiB; cap %.0f GiB; restore hits=0\n",
-           kind, disk_dir_.c_str(), own_archives, disk_used_ / (double)(1ull << 30), peer_archives,
-           peer_bytes / (double)(1ull << 30), disk_budget_ / (double)(1ull << 30));
+    for (int t = 0; t < store_.tiers(); t++) disk_make_room(t, 0);
+    for (int t = 0; t < store_.tiers(); t++) {
+        const auto& tr = store_.tier(t);
+        printf("archive store tier %s %s: %zu objects, %.1f GiB (cap %.1f GiB); sibling %zu archives, %.1f GiB; restore hits=0\n",
+               tr.name.c_str(), tr.dir.c_str(), tr.objects, tr.bytes / (double)gib, tr.cap / (double)gib,
+               peer_archives, peer_bytes / (double)gib);
+    }
     disk_thread_ = std::thread([this] { disk_writer(); });
 }
 
-// Persist the hottest archived checkpoints first, respecting the per-flush byte budget.
-size_t Engine::flush_archives(size_t max_bytes) {
-    if (disk_dir_.empty() || max_bytes == 0) return 0;
+// Persist the hottest archived checkpoints first, respecting the per-flush byte budget. Per session only the latest
+// checkpoint is written; once its file is complete the session's older files go (latest only).
+size_t Engine::flush_archives(size_t max_bytes, int tier) {
+    if (disk_dir_.empty() || max_bytes == 0 || tier >= store_.tiers()) return 0;
     finish();
+    archive_gc();
     std::vector<KvArchive*> hottest;
     hottest.reserve(archives_.size());
     for (auto& a : archives_) {
         if (!a.ram || !a.path.empty() || a.hold) continue;
-        bool covered = false;
-        if (!a.pinned) {
+        bool covered = !a.pinned && qe_archive_store::superseded_in_session(views(), view_index(&a));  // latest only
+        if (!a.pinned && !covered) {
             for (auto& newer : archives_) {
-                if (&newer == &a || newer.pinned || newer.sk != a.sk || newer.n < a.n || newer.used <= a.used) continue;
+                if (&newer == &a || newer.pinned || newer.disk_readonly || newer.used <= a.used) continue;
+                if (newer.sk != a.sk || newer.n < a.n) continue;
                 if (std::equal(a.toks.begin(), a.toks.end(), newer.toks.begin())) {
                     covered = true;
                     break;
@@ -3648,7 +3684,14 @@ size_t Engine::flush_archives(size_t max_bytes) {
     for (KvArchive* a : hottest) {
         FilePlan plan;
         if (!file_plan(*a, plan) || !qe_archive_store::fits(max_bytes, planned, plan.total)) continue;
-        disk_enqueue(*a);
+        // all tiers: the first one with free room (RAM first), else the last tier with LRU eviction
+        int t = tier;
+        if (t < 0) {
+            t = store_.tiers() - 1;
+            for (int i = 0; i < store_.tiers(); i++)
+                if (store_.fits(i, plan.total, disk_covered_) && store_.floor_ok(i, plan.total)) { t = i; break; }
+        }
+        disk_enqueue(*a, t);
         if (a->path.empty()) continue;
         disk_wait_idle();  // let statvfs observe this write before checking the next NVMe object
         if (arch_file_ready(*a)) {
@@ -3657,12 +3700,67 @@ size_t Engine::flush_archives(size_t max_bytes) {
             written += bytes;
             drop_covered(a->sk, a->toks.data(), a->n, a->born, false, a);
             disk_flush_covered();
+            if (a->session) {  // latest checkpoint only: the session's older files, once this one is complete
+                const auto v = views();
+                std::vector<std::list<KvArchive>::iterator> old;
+                for (size_t k : qe_archive_store::older_in_session(v, view_index(a))) old.push_back(std::next(archives_.begin(), k));
+                for (auto it : old) drop_archive(it);
+            }
         } else if (a->disk && a->disk->done && !a->disk->ok) {
             disk_forget(*a);
         }
     }
     persisting_ = was_persisting;
     return written;
+}
+
+std::vector<qe_archive_store::View> Engine::views() const {
+    std::vector<qe_archive_store::View> v;
+    v.reserve(archives_.size());
+    for (auto& a : archives_) v.push_back({a.session, a.expires, a.used, a.pinned || a.hold > 0 || a.disk_readonly});
+    return v;
+}
+size_t Engine::view_index(const KvArchive* p) const {
+    size_t k = 0;
+    for (auto& a : archives_) {
+        if (&a == p) return k;
+        k++;
+    }
+    return 0;
+}
+
+// Drop every archive of the session: memory copies and files of this arm (sibling-arm files are never touched).
+size_t Engine::delete_session(unsigned long long session) {
+    if (!session) return 0;
+    finish();
+    size_t freed = 0;
+    std::vector<std::list<KvArchive>::iterator> hit;
+    for (size_t k : qe_archive_store::delete_targets(views(), session)) hit.push_back(std::next(archives_.begin(), k));
+    for (auto it : hit) {
+        freed += it->total;
+        store_.remove(it->path, false);  // a delete, not an eviction
+        drop_archive(it);
+    }
+    disk_wait_idle();
+    return freed;
+}
+
+// TTL expiry: archives whose class ran out (own files and memory copies; never pinned or sibling ones).
+int Engine::archive_gc() {
+    const long long now = (long long)time(nullptr);
+    std::vector<std::list<KvArchive>::iterator> hit;
+    for (size_t k : qe_archive_store::expired_targets(views(), now)) hit.push_back(std::next(archives_.begin(), k));
+    const int n = (int)hit.size();
+    for (auto it : hit) drop_archive(it);
+    last_gc_s_ = now;
+    return n;
+}
+
+bool Engine::tier_info(int i, double* out) const {
+    if (i < 0 || i >= store_.tiers()) return false;
+    const auto& t = store_.tier(i);
+    out[0] = t.bytes, out[1] = t.objects, out[2] = t.evictions, out[3] = t.cap;
+    return true;
 }
 
 // Archive every live slot (e.g. before the server exits), then flush the persistent store.
@@ -4282,6 +4380,8 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
         q.seq.clear();
         q.sk = sk;
     }
+    q.session = cur_session_;  // every start retags its slot (a reused slot never keeps the previous session)
+    q.expires = cur_ttl_s_ > 0 ? (long long)time(nullptr) + cur_ttl_s_ : 0;
     steer_slot(slot);  // the slot's device steering = its conversation's key (stream-ordered, no graph change)
     const unsigned long long prev_aff = q.affinity;
     q.hint = hint;
@@ -5907,9 +6007,9 @@ void Engine::decode_calibrate() {
     struct KeepDisk {
         Engine& e;
         std::list<KvArchive> a;
-        size_t used;
-        explicit KeepDisk(Engine& x) : e(x), a(std::move(x.archives_)), used(x.disk_used_) { e.archives_.clear(); }
-        ~KeepDisk() { e.archives_ = std::move(a); e.disk_used_ = used; }
+        qe_archive_store::TieredStore st;
+        explicit KeepDisk(Engine& x) : e(x), a(std::move(x.archives_)), st(x.store_) { e.archives_.clear(); }
+        ~KeepDisk() { e.archives_ = std::move(a); e.store_ = std::move(st); }
     } keep_disk(*this);
     if (!comm_.dcal) {  // (comm_free_p2p clears it: no peer access, nothing to time, review L3)
         if (comm_.p2p && comm_.dhost)  // forced QE_DECODE_COMM=host: the same set_dpath rules

@@ -1,4 +1,5 @@
 #pragma once
+#include "archive_tiers.h"
 #include "archive_order.h"
 #include "df_adapt.h"
 #include "mtp_share.h"
@@ -185,8 +186,20 @@ public:
     int num_disk_archives() const;
     // Archive every live slot (and write the configured store) during shutdown.
     void persist();
-    // Persist the hottest archived checkpoints first, up to `max_bytes`, to QE_DISK_CACHE.
-    size_t flush_archives(size_t max_bytes);
+    // Persist the hottest archived checkpoints first, up to `max_bytes`, to the writable tiers: tier < 0 fills the
+    // tiers in order (RAM into its free room, NVMe with LRU eviction), tier >= 0 only that tier (evicting its LRU).
+    size_t flush_archives(size_t max_bytes, int tier = -1);
+    // Session identity of the next start (like set_steering): x-session-hash as a 64-bit value (0: none) and the
+    // TTL in seconds (<= 0: no expiry). Sticky until the next call; every start tags its slot with it.
+    void set_session(unsigned long long session, long long ttl_s) { cur_session_ = session, cur_ttl_s_ = ttl_s; }
+    // Drop every archive (memory copy and files) of the session; returns the bytes freed.
+    size_t delete_session(unsigned long long session);
+    // Drop archives whose TTL ran out; returns the archives dropped.
+    int archive_gc();
+    int num_tiers() const { return store_.tiers(); }
+    // out[0..4) = bytes, objects, evictions, cap of tier i; false when i is out of range
+    bool tier_info(int i, double* out) const;
+    const char* tier_name(int i) const { return i >= 0 && i < store_.tiers() ? store_.tier(i).name.c_str() : ""; }
     // Archive idle conversations to host memory piece by piece (about `budget` bytes per GPU per call), so evicting them
     // later costs nothing on the request path; the server calls it when nothing runs. true when no work remains.
     bool archive_more(size_t budget);
@@ -409,6 +422,8 @@ private:
         // the own region holds keys [split, max_t) (max_t stays the logical capacity)
         int split = 0, pre = -1;
         long long sk = -1;          // steering key of its KV / state (set_steering): never served to another key
+        unsigned long long session = 0;  // x-session-hash of its last start (set_session); 0: none
+        long long expires = 0;      // wall-clock TTL end of that start; 0: none
         // draft statistics (draft_stats): steps, MTP drafted / accepted, lookup drafted / accepted
         long long ds[5] = {0, 0, 0, 0, 0};
         double last_s = 0;          // last start / release, mono_s() (the archive's LRU order)
@@ -632,6 +647,9 @@ private:
         std::vector<size_t> sizes;          // per GPU
         size_t total = 0;
         std::shared_ptr<Bufs> ram;          // null: on disk only
+        int tier = 0;                        // writable tier (store_) of its file
+        unsigned long long session = 0;      // x-session-hash it was archived under (0: none, pinned)
+        long long expires = 0;               // wall-clock TTL end (0: none)
         bool disk_readonly = false;          // a sibling arm's file: indexed and mapped, never touched by this arm
         std::string path;                   // non-empty: in the write store, sibling store, or pending writer
         std::shared_ptr<DiskState> disk;
@@ -736,16 +754,22 @@ private:
     bool press_wait_logged_ = false;
     void mem_pressure();
     qe_memp::Policy::Result press_act(int s, size_t step, std::string& what);
-    bool disk_make_room(size_t need);
+    std::vector<qe_archive_store::View> views() const;  // selection snapshot (archive_tiers.h)
+    size_t view_index(const KvArchive* p) const;
+    bool disk_make_room(int tier, size_t need);
     void disk_forget(KvArchive& a);
     bool archive_load(KvArchive& a);
     void disk_init();
-    void disk_enqueue(KvArchive& a);
+    void disk_enqueue(KvArchive& a, int tier);
     void disk_wait_idle();
     void disk_writer();
-    std::string model_dir_, fingerprint_, disk_dir_;
-    size_t disk_budget_ = 0, disk_used_ = 0;
-    std::atomic<size_t> disk_restore_hits_{0}, disk_evictions_{0};
+    std::string model_dir_, fingerprint_, disk_dir_;  // disk_dir_: the first writable tier (non-empty: a store exists)
+    qe_archive_store::TieredStore store_;
+    unsigned long long cur_session_ = 0;
+    long long cur_ttl_s_ = 0;
+    long long last_gc_s_ = 0;
+    size_t disk_budget_ = 0;  // the largest tier cap: a file bigger than it is never planned
+    std::atomic<size_t> disk_restore_hits_{0};
     struct DiskJob {
         std::shared_ptr<Bufs> ram;
         std::vector<size_t> sizes;

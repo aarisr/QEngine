@@ -407,6 +407,16 @@ class Metrics:
               "interactive sequences parked for background admissions", "counter")
             m("parked_seconds_total", en.get("parked_seconds_total", 0),
               "interactive sequence seconds parked for background admissions", "counter")
+        tiers = (en.get("archives") or {}).get("tiers") or []
+        for name, key, help_, typ in (
+                ("archive_tier_bytes", "bytes", "bytes held by the persistent archive tier", "gauge"),
+                ("archive_tier_objects", "objects", "archive files held by the persistent tier", "gauge"),
+                ("archive_tier_evictions_total", "evictions", "archive files the tier dropped (LRU, TTL, latest-only, cap)", "counter"),
+                ("archive_tier_cap_bytes", "cap", "hard byte cap of the persistent archive tier", "gauge")):
+            if tiers:
+                out.append(f"# HELP qengine_{name} {help_}\n# TYPE qengine_{name} {typ}")
+                for t in tiers:
+                    out.append(f'qengine_{name}{{tier="{t["tier"]}"}} {t[key]}')
         m("queued_requests", sum(1 for j in s["jobs"] if j["state"] == "queued"), "requests waiting")
         for cls in ("interactive", "background"):
             m("queued_by_class", s["queued_by_class"][cls], f"requests waiting (class {cls})",

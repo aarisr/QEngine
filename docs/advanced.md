@@ -832,6 +832,18 @@ NVMe writes are skipped if filesystem use would exceed 85%. Startup removes loca
 objects, malformed archives and files older than seven days. Archives keep QKVA checksums and only the latest flushed
 checkpoint for a matching token prefix is retained. A failed write costs only the cache; serving continues.
 
+**Tiers and sessions (27B).** `QE_CACHE_RAM_DIR` (for example `/dev/shm/qe-l2-27b/<arm>`) and `QE_CACHE_NVME_DIR` (for example
+`/models-fast/qengine-l3/<arm>`) are two independently capped writable tiers; either alone, or `--disk-cache` as the single
+tier, also works. Caps: `QE_CACHE_RAM_GB` (16), `QE_CACHE_NVME_GB` (unset: 1.25 x (KV pool + archive + pins)); the NVMe floor is
+`QE_CACHE_NVME_MAX_PCT` (85); `QE_CACHE_MAX_AGE_S` (7 days). A flush (`POST /admin/archive/flush`, optional `"tier": "ram|nvme|all"`,
+default `all`) puts each checkpoint in the first tier with free room (RAM first) else the last tier by evicting LRU; restore scans RAM
+first, then NVMe, then the read-only directories. Each object lives in one tier. Sessions: `x-session-hash` tags the archive (kept
+in the QKVA0004 header and the file name); a flush keeps only the session's latest checkpoint; `DELETE /api/cache/session/{hash}`
+drops the session's memory copies and files on this arm (refused with 403 unless `QE_ADMIN_TOKEN` is set; then `Authorization: Bearer <token>` is required, 401 otherwise). `x-cache-ttl:
+short|default|long` (unknown: default) sets the expiry, mapped by `QE_CACHE_TTL_SHORT_S` / `_DEFAULT_S` / `_LONG_S` (3600 / 86400 /
+604800); expired archives are dropped once a minute while idle, at each flush and at start. Metrics: `qengine_archive_tier_bytes`,
+`_objects`, `_evictions_total`, `_cap_bytes` with a `tier` label.
+
 Not covered: conversations that didn't fit the host archive are not written, a file is rewritten whole each time, and
 one server per directory (a second one runs without the cache and says so).
 

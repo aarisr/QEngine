@@ -74,6 +74,13 @@ SIGS = {
     "qe_persist": (None, [c_void_p]),
     "qe_num_archives": (c_int, [c_void_p]),
     "qe_archive_flush": (c_i64, [c_void_p, c_i64]),
+    "qe_archive_flush_tier": (c_i64, [c_void_p, c_i64, c_int]),
+    "qe_set_session": (None, [c_void_p, ctypes.c_uint64, c_i64]),
+    "qe_archive_delete_session": (c_i64, [c_void_p, ctypes.c_uint64]),
+    "qe_archive_gc": (c_int, [c_void_p]),
+    "qe_num_tiers": (c_int, [c_void_p]),
+    "qe_tier_info": (c_int, [c_void_p, c_int, P_double]),
+    "qe_tier_name": (ctypes.c_char_p, [c_void_p, c_int]),
     "qe_num_disk_archives": (c_int, [c_void_p]),
     "qe_disk_flush": (c_int, [c_void_p, ctypes.c_double]),
     "qe_last_copied": (c_int, [c_void_p]),
@@ -631,9 +638,42 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         if "qe_persist" in self.fns:
             self.lib.qe_persist(self.h)
 
-    def flush_archives(self, max_bytes):
-        """Persist up to max_bytes from the hottest archived checkpoints to QE_DISK_CACHE."""
+    def flush_archives(self, max_bytes, tier=-1):
+        """Persist up to max_bytes from the hottest archived checkpoints to the writable tiers (tier -1: RAM first,
+        then NVMe; else only that tier index)."""
+        if "qe_archive_flush_tier" in self.fns:
+            return self.lib.qe_archive_flush_tier(self.h, int(max_bytes), int(tier))
         return self.lib.qe_archive_flush(self.h, int(max_bytes)) if "qe_archive_flush" in self.fns else 0
+
+    def tier_index(self, name):
+        """Index of a writable tier by name ("ram", "nvme"), -1 when this arm has no such tier."""
+        for i, t in enumerate(self.tier_stats()):
+            if t["tier"] == name:
+                return i
+        return -1
+
+    def set_session(self, session, ttl_s=0):
+        """Tag the next start's conversation with the x-session-hash (hex string; None: untagged) and a TTL in seconds."""
+        if "qe_set_session" in self.fns:
+            self.lib.qe_set_session(self.h, int(session, 16) & (2**64 - 1) if session else 0, int(ttl_s))
+
+    def delete_session(self, session):
+        """Drop the session's archives (memory and files); the bytes freed."""
+        if "qe_archive_delete_session" not in self.fns or not session:
+            return 0
+        return self.lib.qe_archive_delete_session(self.h, int(session, 16) & (2**64 - 1))
+
+    def tier_stats(self):
+        """Per writable tier: name, bytes, objects, evictions, cap (empty when the engine has no store)."""
+        if "qe_num_tiers" not in self.fns:
+            return []
+        out = []
+        buf = (ctypes.c_double * 4)()
+        for i in range(self.lib.qe_num_tiers(self.h)):
+            if self.lib.qe_tier_info(self.h, i, buf):
+                out.append({"tier": self.lib.qe_tier_name(self.h, i).decode(), "bytes": buf[0], "objects": int(buf[1]),
+                            "evictions": int(buf[2]), "cap": buf[3]})
+        return out
 
     def disk_flush(self, seconds):
         """Flash-Next: persist() only queues the files; wait for them, at most `seconds`. True: all written."""
@@ -724,7 +764,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
                               "idle_s": round(r[3] / 1000.0, 1) if r[3] >= 0 else None, "generating": bool(r[5])})
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots, "conversations": cl,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
-                             "pinned_bytes": a[4], "pinned_used": a[5], "disk_evictions": int(a[6])},
+                             "pinned_bytes": a[4], "pinned_used": a[5], "disk_evictions": int(a[6]),
+                             "tiers": self.tier_stats()},
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
                 "paused": c[5], "parked_interactive_total": bg_pause_count[0],
                 "parked_seconds_total": bg_pause_seconds[0]}
