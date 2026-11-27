@@ -14,6 +14,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from qe_env import env_int
+
 COUNTERS = ("requests", "errors", "prompt_tokens", "cached_tokens", "prefill_tokens", "prefill_s",
             "gen_tokens", "decode_s", "steps", "seq_steps", "images", "image_tokens", "energy_j",
             "uptime_s", "spec_steps", "spec_drafted", "spec_accepted", "think_tokens")
@@ -24,6 +26,7 @@ class Metrics:
         self.lock = threading.Lock()
         self.path = path
         self.name = served_name
+        self.bg_reserved_seqs = max(0, env_int("QE_BG_RESERVED_SEQS", 0))
         self.t0 = time.time()
         self.session = dict.fromkeys(COUNTERS, 0)
         self.session["cache_src"] = {}
@@ -268,6 +271,14 @@ class Metrics:
             x.pop(k, None)
         return x
 
+    def active_by_class(self):
+        with self.lock:
+            active = {"interactive": 0, "background": 0}
+            for j in self.jobs.values():
+                if j["state"] != "queued":
+                    active[j.get("class", "interactive")] += 1
+            return active
+
     def snapshot(self):
         now = time.time()
         with self.lock:
@@ -294,6 +305,9 @@ class Metrics:
                          "step_ms": sm[len(sm) // 2] if sm else 0,
                          "tokens_per_step": s["gen_tokens"] / s["seq_steps"] if s["seq_steps"] else 0},
                 "jobs": jobs, "queued_by_class": queued_by_class,
+                "active_by_class": {"interactive": sum(1 for j in jobs if j["state"] != "queued" and j.get("class") != "background"),
+                                    "background": sum(1 for j in jobs if j["state"] != "queued" and j.get("class") == "background")},
+                "bg_reserved_seqs": self.bg_reserved_seqs,
                 "ended": [x for _, x in self.ended], "recent": list(self.last_done)[::-1],
                 "session": s, "global": g, "records": dict(self.records), "session_records": dict(self.srec),
                 "engine": self.engine, "gpus": self.gpus, "history": list(self.hist)[-300:],
@@ -350,6 +364,13 @@ class Metrics:
         m("energy_joules_total", round(se["energy_j"], 1), "GPU energy since start", "counter")
         m("decode_tokens_per_second", round(s["rate"]["tok_s_10"], 2), "decode rate (10 s)")
         m("active_sequences", sum(1 for j in s["jobs"] if j["state"] != "queued"), "sequences running")
+        m("bg_reserved_seqs", s["bg_reserved_seqs"], "sequence slots reserved for background requests")
+        m("background_active_sequences", s["active_by_class"]["background"], "active background sequences")
+        if en:
+            m("parked_interactive_total", en.get("parked_interactive_total", 0),
+              "interactive sequences parked for background admissions", "counter")
+            m("parked_seconds_total", en.get("parked_seconds_total", 0),
+              "interactive sequence seconds parked for background admissions", "counter")
         m("queued_requests", sum(1 for j in s["jobs"] if j["state"] == "queued"), "requests waiting")
         for cls in ("interactive", "background"):
             m("queued_by_class", s["queued_by_class"][cls], f"requests waiting (class {cls})",

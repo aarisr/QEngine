@@ -209,6 +209,8 @@ public:
     // true: the start fits now. `cls`: the caller's request class (0 interactive, 1 background);
     // a background start never pauses an interactive decoder (otherwise user decision 2026-11-12 kept).
     bool pause_for(int n, int cls);
+    bool class_admission_allowed(int cls, int reserved) const;
+    void background_pause_stats(long long* count, double* seconds) const;
     // Scheduling value of a slot's conversation (0 = finished subagent, 1 = normal, 2 = the main
     // thread): logs and slot_info only; no eviction, archive, pin, snapshot or pause order reads it
     // (user decision 2026-11-12: every conversation alike).
@@ -302,6 +304,8 @@ private:
     bool kvs_auto_ = false;  // shares chosen in plan_slots from the free memory after the weights
     long long n_grow_ = 0, n_move_ = 0, n_evict_ = 0, n_pause_ = 0, n_unpause_ = 0, n_release_ = 0;
     long long n_park_ = 0, n_unpark_ = 0;  // [q27-park-c]
+    long long n_bg_pause_ = 0;
+    double bg_pause_seconds_ = 0;
     int max_ctx_ = 0;
     bool yarn_auto_ = false;  // the YaRN factor came from --max-ctx (plan_slots may lower it to the pool's reach)
     int round_cap(int need) const;
@@ -395,6 +399,7 @@ private:
         bool rb_batched = false;
         bool full = false;          // no room to grow (step_batch): ends with its end token until released
         bool paused = false;        // preempted for room (paused_): its steps return no tokens until resumed
+        double bg_pause_started = 0; // interactive sequence paused for a background admission
         bool waiting = false;       // (step_batch) no room under VRAM pressure and no archive room: no tokens this step
         bool vwait = false;         // paused / waiting because of VRAM pressure (slot_info: 2), until it steps again
         double vtry = 0;            // the last pause attempt under VRAM pressure (one per second, review N-L1)

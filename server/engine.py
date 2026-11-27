@@ -81,6 +81,8 @@ SIGS = {
     "qe_archive_info": (None, [c_void_p, P_double]),
     "qe_conv_list": (c_int, [c_void_p, P_i64, c_int]),
     "qe_pool_counters": (None, [c_void_p, P_i64]),
+    "qe_background_pause_stats": (None, [c_void_p, P_i64, P_double]),
+    "qe_class_admission_allowed": (c_int, [c_void_p, c_int, c_int]),
     "qe_watch_stops": (None, [c_void_p, c_int, c_int]),
     "qe_set_no_ahead": (None, [c_void_p, c_int, c_int]),
     "qe_drafts": (c_int, [c_void_p, c_int, P_int]),
@@ -149,7 +151,7 @@ GROUPS = {
                  "qe_vocab"),
     "vision": ("qe_start_mm", "qe_start_begin"),
 }
-SINGLE = ("qe_par_info", "qe_host_mem_info", "qe_graph_info", "qe_set_exit_hook", "qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_set_limit", "qe_warmup",
+SINGLE = ("qe_par_info", "qe_host_mem_info", "qe_graph_info", "qe_set_exit_hook", "qe_vocab", "qe_num_slots", "qe_pool_tokens", "qe_kv_in_ram", "qe_can_admit", "qe_pause_for", "qe_background_pause_stats", "qe_class_admission_allowed", "qe_set_limit", "qe_warmup",
           "qe_reset", "qe_set_lookahead", "qe_ban_tokens")
 
 
@@ -531,6 +533,11 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         if "qe_set_concurrent" in self.fns:
             self.lib.qe_set_concurrent(self.h, int(on))
 
+    def class_admission_allowed(self, cls, reserved):
+        if "qe_class_admission_allowed" not in self.fns:
+            return None
+        return bool(self.lib.qe_class_admission_allowed(self.h, int(cls), int(reserved)))
+
     def can_admit(self, n):
         """A new sequence of n tokens fits next to the running ones (free slot + pool room)."""
         if "qe_can_admit" in self.fns:
@@ -698,6 +705,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         c = (ctypes.c_longlong * 6)()  # grow, move, evict, pause, resume, paused now
         if "qe_pool_counters" in self.fns:
             L.qe_pool_counters(h, c)
+        bg_pause_count = (ctypes.c_longlong * 1)()
+        bg_pause_seconds = (ctypes.c_double * 1)()
+        if "qe_background_pause_stats" in self.fns:
+            L.qe_background_pause_stats(h, bg_pause_count, bg_pause_seconds)
         cl = []
         if convs and "qe_conv_list" in self.fns:  # least recently used first: the next to leave VRAM / the archive
             m = 256
@@ -710,7 +721,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                              "pinned_bytes": a[4], "pinned_used": a[5]},
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
-                "paused": c[5]}
+                "paused": c[5], "parked_interactive_total": bg_pause_count[0],
+                "parked_seconds_total": bg_pause_seconds[0]}
 
     # ------------------------------------------------------------------ stop sequences
     def watch_stops(self, slot, on=True):

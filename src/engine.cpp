@@ -1355,6 +1355,10 @@ bool Engine::unpause_slot(int v) {
     q.pos = p.pos;
     q.seq = std::move(p.seq);
     paused_.erase(it);
+    if (q.bg_pause_started > 0) {
+        bg_pause_seconds_ += std::max(0.0, vnow_s() - q.bg_pause_started);
+        q.bg_pause_started = 0;
+    }
     q.paused = false;
     q.vwait = false;
     q.rb_epoch = -1;
@@ -1690,6 +1694,10 @@ static size_t seq_headroom(size_t ah, int pos, int end) {
 bool Engine::pause_for(int n, int cls) {
     const size_t ah = admit_headroom();
     if (n > max_ctx_) return false;
+    static const int bg_reserved = std::max(0, env_int("QE_BG_RESERVED_SEQS", 0));
+    int active_background = 0;
+    for (const Seq& q : seqs_)
+        active_background += q.active && q.cls == qe_pool::kClassBackground;
     bool slot = false;
     size_t used = 0;
     struct V { int j; size_t u; };
@@ -1701,26 +1709,54 @@ bool Engine::pause_for(int n, int cls) {
         else if (!q.paused) {
             const size_t u = units(std::min<size_t>((size_t)q.pos - q.split + seq_headroom(ah, q.pos, q.rlim), max_ctx_));
             used += u;
-            if (q.max_t > 0 && q.pos > q.split && qe_pool::pausable_by(cls, q.cls)) vs.push_back({(int)i, u});
+            int older_background = 0;
+            if (q.cls == qe_pool::kClassBackground)
+                for (const Seq& other : seqs_)
+                    older_background += other.active && other.cls == qe_pool::kClassBackground &&
+                                       other.admit < q.admit;
+            const bool reserved_background = q.cls == qe_pool::kClassBackground &&
+                                             older_background < bg_reserved;
+            if (q.max_t > 0 && q.pos > q.split &&
+                qe_pool::pausable_by(cls, q.cls, active_background, bg_reserved, reserved_background))
+                vs.push_back({(int)i, u});
         }
     }
     for (auto& p : pres_) used += units(p.n);
     const size_t need = units(std::min<size_t>((size_t)n + ah, max_ctx_));
-    if (!slot) return false;  // every slot is taken: pausing frees no slot
+    if (!slot) return false;
     if (used + need <= pool_tokens_) return true;
-    // the pool's own preemption order (room_or_pause): the most recently admitted first, every conversation
-    // alike within its class (a background caller only sees background decoders, never an interactive one)
     std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) { return qe_pool::pauses_first(seqs_[a.j].admit, seqs_[b.j].admit); });
     size_t k = 0, left = used;
     while (k < vs.size() && left + need > pool_tokens_) left -= vs[k++].u;
-    if (left + need > pool_tokens_) return false;  // pausing all of them would not make it fit: pause none
+    if (left + need > pool_tokens_) return false;
     for (size_t i = 0; i < k; i++) {
+        const int slot = vs[i].j;
         if (pool_log_)
-            printf("pool: pausing slot %d for a %d-token start\n", vs[i].j, n),
+            printf("pool: pausing slot %d for a %d-token start\n", slot, n),
                 fflush(stdout);
-        if (!pause_slot(vs[i].j)) return false;
+        if (!pause_slot(slot)) return false;
+        if (cls == qe_pool::kClassBackground && seqs_[slot].cls == qe_pool::kClassInteractive) {
+            seqs_[slot].bg_pause_started = vnow_s();
+            n_bg_pause_++;
+        }
     }
     return true;
+}
+
+bool Engine::class_admission_allowed(int cls, int reserved) const {
+    int active_interactive = 0;
+    for (const Seq& q : seqs_)
+        active_interactive += q.active && q.cls == qe_pool::kClassInteractive;
+    return qe_pool::may_admit(cls, active_interactive, (int)seqs_.size(), reserved);
+}
+
+void Engine::background_pause_stats(long long* count, double* seconds) const {
+    *count = n_bg_pause_;
+    *seconds = bg_pause_seconds_;
+    const double now = vnow_s();
+    for (const Seq& q : seqs_)
+        if (q.bg_pause_started > 0)
+            *seconds += std::max(0.0, now - q.bg_pause_started);
 }
 
 bool Engine::can_admit(int n) {
@@ -4723,6 +4759,10 @@ void Engine::release(int slot) {
     }
     lkb_inval(slot);
     if (seqs_.at(slot).active) n_release_++, seqs_[slot].last_s = mono_s();  // room may have freed: paused slots try to resume
+    if (seqs_[slot].bg_pause_started > 0) {
+        bg_pause_seconds_ += std::max(0.0, vnow_s() - seqs_[slot].bg_pause_started);
+        seqs_[slot].bg_pause_started = 0;
+    }
     if (seqs_[slot].paused) {  // released while paused: its archive stays (the next turn resumes from it)
         auto it = paused_.find(slot);
         it->second.arch->hold--;

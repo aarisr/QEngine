@@ -56,6 +56,7 @@ int qe_can_admit(void* e, int n);            // a new n-token sequence fits now;
 int qe_pause_for(void* e, int n, int cls);  // pause decoding sequences of lower cls (lowest first, never a prefill; a
                                              // background caller cannot pause an interactive decoder) until a new n-token
                                              // sequence fits; 1: it fits now (nothing paused if it cannot)
+int qe_class_admission_allowed(void* e, int cls, int reserved); // 1 if class may use another sequence seat
 void qe_protect_ids(void* e, const int* ids, int n);  // [ink-archprot] the prompt the next qe_pause_for / qe_park makes room
                                              // for: its host-store source is kept if the copies fit without it (Inkling); optional
 // park a decoding sequence (KV rows + recurrent state to a held host archive, slot released): handle >= 0, -1 refused;
@@ -122,6 +123,7 @@ int qe_disk_flush(void* e, double seconds);  // optional (Flash-Next): wait for 
 void qe_slot_info(void* e, int i, long long* out);  // {offset, capacity, cached tokens, active, last use, prio}
 void qe_archive_info(void* e, double* out);         // {ram n, ram bytes, disk n, disk bytes, pinned bytes, pinned used}
 void qe_pool_counters(void* e, long long* out);     // {grow, move, evict}
+void qe_background_pause_stats(void* e, long long* count, double* seconds);
 
 // ======================================================= TIER 7 "stops": exact stop-sequence cut (all or none)
 void qe_watch_stops(void* e, int slot, int on);  // keep next-step drafts (qe_drafts) and the undo of the last step

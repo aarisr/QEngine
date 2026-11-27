@@ -21,6 +21,9 @@ class FakeEngine:
     def pause_state(self):  # (pause events so far, paused now), as qe_pool_counters c[3] / c[5]
         return self.npause, len(self.paused)
 
+    def resume(self, slot):
+        self.paused.discard(slot)
+
     def set_steering(self, *a):
         pass
 
@@ -119,6 +122,14 @@ g, adm = gen(e, [job(30000, waited=5)])
 check("admitted", adm.admit_next(NOW, []), 0)
 check("paused: the most recently admitted one only (slot 1, 40K)", sorted(e.paused), [1])
 check("pauses counted", g.sched["pauses"], 1)
+# A background admission parks an interactive slot; its token/cache snapshot survives resume.
+e = FakeEngine(100000)
+e.active = {0: (40000, 1, False), 1: (75000, 2, False)}
+state = e.active[1]
+check("background can pause a live interactive sequence", e.pause_for(30000, 1), True)
+check("park retains the full active sequence state", e.active[1], state)
+e.resume(1)
+check("resume restores the same active sequence state", e.active[1], state)
 e = FakeEngine(100000)
 e.active = {0: (40000, 1, False), 1: (75000, 2, False)}
 g, adm = gen(e, [job(30000, prio=2, waited=5)])

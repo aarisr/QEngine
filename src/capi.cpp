@@ -274,6 +274,12 @@ int qe_host_mem_info(void* e, char* buf, int n) {
 }
 int qe_can_admit(void* e, int n) { return ((Engine*)e)->can_admit(n); }
 int qe_pause_for(void* e, int n, int cls) { return ((Engine*)e)->pause_for(n, cls) ? 1 : 0; }
+int qe_class_admission_allowed(void* e, int cls, int reserved) {
+    return ((Engine*)e)->class_admission_allowed(cls, reserved) ? 1 : 0;
+}
+void qe_background_pause_stats(void* e, long long* count, double* seconds) {
+    ((Engine*)e)->background_pause_stats(count, seconds);
+}
 // [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
 int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
 int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }

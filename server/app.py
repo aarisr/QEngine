@@ -1051,7 +1051,8 @@ class Admission:
             # expert copies) and mode B keep it off)
             pk = 1 if fam == "qwen38-27b" or (fam == "qwen38-flash-next" and self.multi and not self.pass_bound and
                                               (getattr(gen.engine, "par", None) or {}).get("mode", "tp") == "tp") else 0
-        self.seats = len(getattr(self.e, "slots", []) or [])
+        self.seats = len(getattr(self.e, "slots", []) or []) or int(getattr(self.e, "nslots", 0))
+        self.bg_reserved = max(0, env_int("QE_BG_RESERVED_SEQS", 0))
         rv = getattr(a, "park_reserve", None)
         if rv is None:  # (Flash-Next: the reserved seats' prompts share prefill batches; 4 measured over 2)
             rv = PARK_RESERVE_MULTI if self.multi else PARK_RESERVE
@@ -1261,6 +1262,16 @@ class Admission:
             j = g.queue[i]
             if blocked is not None and now - blocked.t_enq > self.backfill_wait:
                 continue  # starvation guard: nothing passes it any more
+            if j.cls != 1:
+                allowed = e.class_admission_allowed(j.cls, self.bg_reserved) if hasattr(e, "class_admission_allowed") else None
+                if allowed is None:
+                    metrics = getattr(g, "metrics", None)
+                    active = metrics.active_by_class() if metrics else {"interactive": 0, "background": 0}
+                    allowed = active["interactive"] < max(0, self.seats - self.bg_reserved)
+                if not allowed:
+                    if blocked is None:
+                        blocked = j
+                    continue
             need = len(j.ids) + self.k + 2
             if e.can_admit(need):
                 if blocked is not None:
