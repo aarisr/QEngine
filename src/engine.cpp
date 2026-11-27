@@ -200,7 +200,7 @@ Engine::Engine(const std::string& model_dir, const std::vector<int>& devices, in
             struct stat stt;
             if (stat(f.c_str(), &stt) == 0) fp << "|" << f.substr(f.rfind('/') + 1) << ":" << stt.st_size << ":" << stt.st_mtime;
         }
-        gemm_tune_set_model(fp.str());
+        gemm_tune_set_model(fp.str(), devices);
     }
     if (env_set("QE_MTP_ADAPT")) adapt_ = env_int("QE_MTP_ADAPT", adapt_);
     // [q27-mba] QE_MTP_BATCH_ADAPT: the sequences of a batched step share its rows for their MTP drafts by each one's

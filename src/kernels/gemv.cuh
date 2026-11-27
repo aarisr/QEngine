@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 #include <algorithm>
 
 #include "../common.h"
@@ -111,9 +112,9 @@ void gemm_reserve_multi(bool on);  // keep several reservations per (card, buffe
 size_t qe_ws_alloc(void** p, size_t bytes, const char* what);
 void qe_ws_reserve(const char* what, size_t bytes);
 void gemm_set_sk_maxparts(int n);  // (bench) cap of the stream-K split count, 0 = default
-// Persisted GEMM tuning table (gemm.cu TuneStore): model = fingerprint of the weights; enables it
+// Persisted GEMM tuning table: the weight fingerprint plus GPU/card/kernel-set identity selects a table.
 // (QE_TUNE_FILE=path / off). defer on: this thread's new choices are saved once, when it is turned off.
-void gemm_tune_set_model(const std::string& model);
+void gemm_tune_set_model(const std::string& model, const std::vector<int>& devices);
 void gemm_tune_defer(bool on);
 // the autotuner when QE_GEMM_TUNE is unset (default on); call before the first GEMM
 void gemm_tune_default(bool on);

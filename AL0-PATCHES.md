@@ -26,6 +26,7 @@ Everything else stays here.
 | 0027 | 27b: batched MTP steps share rows by each conversation's acceptance | cooking (needs its own A/B) |
 | 0028 | metrics: Prometheus series for speculative decoding, prompt-cache source, thinking tokens | cooking (better as an issue first; upstream has its own stats path) |
 | 0029 | server: reserve N slots for background requests (`QE_BG_RESERVED_SEQS`, default 0 = off); a waiting background request may park the newest interactive seq | fork-only for now (tied to our request-class header; candidate for a generic proposal later) |
+| 0030 | GEMM: reuse tune tables across builds with the same GPU/card/kernel-set identity; import the compatible 1.6.2 table once | build + CPU identity test; live no-retune confirmation awaits next planned arm restart |
 
 Dropped: 0024 (pinned/split archives to disk). Upstream fixed the same problem in 1.6.0 (#47) without a new file format.
 

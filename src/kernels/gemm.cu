@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "gemv.cuh"
+#include "../gemm_tune_key.h"
 #include "q8_layout.h"
 
 namespace {
@@ -4114,6 +4115,7 @@ void gemm_run(int ci, const W4& w, const bf16* x, int ldx, float* c, int ldc, in
     }
 }
 
+// GEMM_TUNE_CACHE_BEGIN
 // Measured GEMM choices per device: (n, k, power-of-two token bucket, glu) -> (candidate, split-K).
 using TuneKey = std::tuple<int, int, int, bool>;
 using TuneMap = std::map<TuneKey, std::pair<int, int>>;
@@ -4128,18 +4130,19 @@ bool gemm_tune_on() {
 // Persisted tuning table: the timed choice differs between processes
 // (noise), so does the rounding of everything downstream. The first process that tunes a key writes
 // it to a small text file; later processes use the stored choice without timing (bit-identical
-// results across restarts) and only tune keys the file lacks. The header fingerprints everything
-// the choice depends on (build of this file, candidate list, CUDA runtime / driver, model, the
-// environment variables that change the GEMM kernels); a device section is matched by its PCI bus
-// id, name and SM count. Any mismatch or a malformed file: ignored and rewritten. Written via a
-// temporary file + rename (a reader sees the old or the new file, never a half-written one).
+// results across restarts) and only tune keys the file lacks. The stable header fingerprints the
+// model, CUDA runtime/driver, GEMM environment, GPU model/card count and kernel-set hash; build
+// date/time is deliberately excluded. A device section is matched by PCI bus id, name and SM count.
+// Any mismatch or malformed file is ignored; writes use a temporary file + rename, so readers
+// see the old or the new table, never a half-written one.
 // Only the engine enables it (gemm_tune_set_model); QE_TUNE_FILE=path overrides the location
 // (default ~/.cache/qengine/gemm_tune-<model dir name>-<hash of the setup>.txt, the newest
 // kTuneKeep of a model kept), QE_TUNE_FILE=off disables it.
 struct TuneStore {
     std::mutex mu;
     bool on = false, loaded = false, dirty = false, warned = false, pruned = false, retune = false;
-    std::string path, header, dir, prefix;  // dir, prefix: default location (tune_prune)
+    std::string path, header, dir, prefix, legacy_path, legacy_setup;
+    std::vector<std::string> legacy_devices;
     std::map<std::string, TuneMap> devs;  // device line -> choices
 };
 TuneStore& tune_store() {
@@ -4158,30 +4161,47 @@ std::string tune_dev_line(int dev) {
     snprintf(b, sizeof(b), "device %s %s sm%d cc%d.%d", bus, p.name, p.multiProcessorCount, p.major, p.minor);
     return b;
 }
-// Parses path; false (message on stderr) unless the header matches and the file is complete.
-bool tune_read(const TuneStore& s, std::map<std::string, TuneMap>& out, bool verbose) {
-    FILE* f = fopen(s.path.c_str(), "r");
+// Parses a current file or imports a v1 table only when its model, CUDA setup, environment, and
+// exact physical-device set still match. V1 did not record the kernel-set key; its explicit
+// candidate manifest plus exact per-device sections are the compatibility check for the migration.
+bool tune_read_file(const std::string& path, const std::string& expected_header, bool allow_legacy,
+                    const std::string& legacy_setup, const std::vector<std::string>& legacy_devices,
+                    std::map<std::string, TuneMap>& out, bool verbose) {
+    FILE* f = fopen(path.c_str(), "r");
     if (!f) return false;
-    std::string hdr, line, dev;
-    bool ok = false, in_hdr = true;
+    std::vector<std::string> header;
+    std::string line, dev;
+    bool ok = false, in_header = true, imported_legacy = false;
     char buf[1024];
     std::map<std::string, TuneMap> m;
+    auto header_matches = [&]() {
+        std::string current;
+        for (const auto& h : header) current += h + "\n";
+        if (current == expected_header) return true;
+        if (allow_legacy && header.size() >= 2 && header[0] == "qengine-gemm-tune 1" &&
+            header[1].rfind("built ", 0) == 0) {
+            std::string old_setup;
+            for (size_t i = 2; i < header.size(); ++i) old_setup += header[i] + "\n";
+            if (old_setup == legacy_setup) { imported_legacy = true; return true; }
+        }
+        return false;
+    };
     while (fgets(buf, sizeof(buf), f)) {
         line = buf;
         if (!line.empty() && line.back() == '\n') line.pop_back();
         if (line == "end") { ok = true; break; }
         if (line.rfind("device ", 0) == 0) {
-            if (in_hdr && hdr != s.header) {
-                if (verbose) fprintf(stderr, "gemm tune: %s is for another build / model / setup, retuning\n", s.path.c_str());
+            if (in_header && !header_matches()) {
+                if (verbose) fprintf(stderr, "gemm tune: %s has another kernel/model/setup key\n", path.c_str());
                 fclose(f);
                 return false;
             }
-            in_hdr = false;
+            in_header = false;
             dev = line;
             m[dev];
             continue;
         }
-        if (in_hdr) { hdr += line + "\n"; continue; }
+        if (in_header) { header.push_back(line); continue; }
         int n, k, b, g, ci, ks;
         if (sscanf(line.c_str(), "%d %d %d %d %d %d", &n, &k, &b, &g, &ci, &ks) != 6 || ci < 0 || ci > 3 ||
             ks < 1 || ks > 8)
@@ -4189,14 +4209,25 @@ bool tune_read(const TuneStore& s, std::map<std::string, TuneMap>& out, bool ver
         m[dev][std::make_tuple(n, k, b, g != 0)] = std::make_pair(ci, ks);
     }
     fclose(f);
-    if (ok && in_hdr && hdr != s.header) ok = false;  // header only, another setup
+    if (ok && in_header && !header_matches()) ok = false;
     if (!ok) {
-        if (verbose) fprintf(stderr, "gemm tune: %s is malformed or truncated, ignored\n", s.path.c_str());
+        if (verbose) fprintf(stderr, "gemm tune: %s is malformed, truncated, or has another setup key\n", path.c_str());
         return false;
+    }
+    if (imported_legacy) {
+        if (m.size() != legacy_devices.size()) return false;
+        for (const auto& d : legacy_devices) if (!m.count(d)) return false;
     }
     out = std::move(m);
     return true;
 }
+bool tune_read(const TuneStore& s, std::map<std::string, TuneMap>& out, bool verbose) {
+    return tune_read_file(s.path, s.header, false, "", {}, out, verbose);
+}
+bool tune_read_legacy(const TuneStore& s, std::map<std::string, TuneMap>& out, bool verbose) {
+    return tune_read_file(s.legacy_path, s.header, true, s.legacy_setup, s.legacy_devices, out, verbose);
+}
+void tune_save(TuneStore& s);  // called under s.mu
 void tune_load(TuneStore& s) {  // under s.mu
     if (s.loaded || !s.on) return;
     s.loaded = true;
@@ -4209,6 +4240,15 @@ void tune_load(TuneStore& s) {  // under s.mu
         size_t n = 0;
         for (auto& d : s.devs) n += d.second.size();
         fprintf(stderr, "gemm tune: %zu stored choices (%zu devices) from %s\n", n, s.devs.size(), s.path.c_str());
+        return;
+    }
+    if (tune_read_legacy(s, s.devs, true)) {
+        size_t n = 0;
+        for (auto& d : s.devs) n += d.second.size();
+        fprintf(stderr, "gemm tune: imported %zu legacy choices (%zu devices) after matching candidate/model/CUDA/env and device entries; saving %s\n",
+                n, s.devs.size(), s.path.c_str());
+        s.dirty = true;
+        tune_save(s);
     }
 }
 constexpr int kTuneKeep = 8;
@@ -4305,7 +4345,7 @@ void gemm_reserve_multi(bool on) { tl_reserve_multi(on); }  // (was defined insi
 size_t qe_ws_alloc(void** p, size_t bytes, const char* what) { return tl_alloc(p, bytes, what); }
 void qe_ws_reserve(const char* what, size_t bytes) { tl_reserve(what, bytes); }
 
-void gemm_tune_set_model(const std::string& model) {
+void gemm_tune_set_model(const std::string& model, const std::vector<int>& devices) {
     TuneStore& s = tune_store();
     std::lock_guard<std::mutex> l(s.mu);
     const char* f = env_str("QE_TUNE_FILE");
@@ -4313,20 +4353,45 @@ void gemm_tune_set_model(const std::string& model) {
     int rt = 0, drv = 0;
     cudaRuntimeGetVersion(&rt);
     cudaDriverGetVersion(&drv);
-    // setup: everything but the build time (it names the file, so tests / servers with another env,
-    // MTP head or worktree keep their own tables instead of overwriting one another)
-    std::string setup = "build " __FILE__ "\n";
-    setup += "cands 32x1:0.80 64x1:0.93 128x1:1.0 128x2:0.96 ks1,2,4 bucket64 tuner median-rr warmup1 ab3% reps" +
-             std::to_string(std::max(1, env_int("QE_GEMM_TUNE_REPS", 7))) + "\n";
-    setup += "cuda runtime " + std::to_string(rt) + " driver " + std::to_string(drv) + "\n";
-    setup += "model " + model + "\n";
-    setup += "env";
-    for (const char* e : kTuneEnv) setup += std::string(" ") + e + "=" + (env_str(e) ? env_str(e) : "-");
-    setup += "\n";
-    // a rebuilt gemm.cu (kernels may have changed): same file, retuned
-    s.header = "qengine-gemm-tune 1\nbuilt " __DATE__ " " __TIME__ "\n" + setup;
-    if (f) s.path = f;
-    else {
+    const std::string candidates =
+        "cands 32x1:0.80 64x1:0.93 128x1:1.0 128x2:0.96 ks1,2,4 bucket64 tuner median-rr warmup1 ab3% reps" +
+        std::to_string(std::max(1, env_int("QE_GEMM_TUNE_REPS", 7))) + "\n";
+    // Keep this pre-v2 identity for a one-time import of tables written by 1.6.2.
+    s.legacy_setup = "build " __FILE__ "\n" + candidates;
+    s.legacy_setup += "cuda runtime " + std::to_string(rt) + " driver " + std::to_string(drv) + "\n";
+    s.legacy_setup += "model " + model + "\n";
+    s.legacy_setup += "env";
+    for (const char* e : kTuneEnv) s.legacy_setup += std::string(" ") + e + "=" + (env_str(e) ? env_str(e) : "-");
+    s.legacy_setup += "\n";
+
+    std::vector<gemm_tune_key::Device> hardware;
+    s.legacy_devices.clear();
+    for (int dev : devices) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            hardware.push_back({prop.name, prop.multiProcessorCount, prop.major, prop.minor});
+        } else {
+            cudaGetLastError();
+            hardware.push_back({"unknown", 0, 0, 0});
+        }
+        s.legacy_devices.push_back(tune_dev_line(dev));
+    }
+    std::sort(s.legacy_devices.begin(), s.legacy_devices.end());
+    std::string setup = s.legacy_setup + gemm_tune_key::hardware(hardware, QE_GEMM_KERNEL_SET_HASH);
+    s.header = "qengine-gemm-tune 2\n" + setup;
+
+    auto setup_hash = [](const std::string& text) {
+        unsigned long long h = 1469598103934665603ull;  // FNV-1a
+        for (unsigned char c : text) h = (h ^ c) * 1099511628211ull;
+        char hx[16];
+        snprintf(hx, sizeof(hx), "%08llx", (h ^ (h >> 32)) & 0xffffffffull);
+        return std::string(hx);
+    };
+    if (f) {
+        s.path = f;
+        s.legacy_path = f;
+        s.prefix.clear();
+    } else {
         const char* xdg = env_str("XDG_CACHE_HOME");
         const char* home = env_str("HOME");
         if (xdg && *xdg) s.dir = std::string(xdg) + "/qengine";
@@ -4337,12 +4402,9 @@ void gemm_tune_set_model(const std::string& model) {
         std::string base = m.substr(m.rfind('/') + 1);
         for (char& c : base)
             if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.') c = '_';
-        unsigned long long h = 1469598103934665603ull;  // FNV-1a
-        for (unsigned char c : setup) h = (h ^ c) * 1099511628211ull;
-        char hx[16];
-        snprintf(hx, sizeof(hx), "%08llx", (h ^ (h >> 32)) & 0xffffffffull);
         s.prefix = "gemm_tune-" + (base.empty() ? std::string("model") : base) + "-";
-        s.path = s.dir + "/" + s.prefix + hx + ".txt";
+        s.legacy_path = s.dir + "/" + s.prefix + setup_hash(s.legacy_setup) + ".txt";
+        s.path = s.dir + "/" + s.prefix + setup_hash(setup) + ".txt";
     }
     s.on = true;
     s.loaded = false;
@@ -4357,6 +4419,7 @@ void gemm_tune_defer(bool on) {
     std::lock_guard<std::mutex> l(s.mu);
     tune_save(s);
 }
+// GEMM_TUNE_CACHE_END
 void gemm_set_sk_maxparts(int n) { g_sk_maxparts_rt = n; }
 
 void gemm_w4(const W4& w, const bf16* x, int ldx, float* c, int ldc, int t, cudaStream_t st) {

@@ -95,6 +95,48 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 file(GLOB KERNELS CONFIGURE_DEPENDS src/kernels/*.cu)
+# The tune cache survives host-only rebuilds. Hash CUDA sources/headers and target architectures;
+# GEMM's host tuning implementation and GEMV's host API are excluded from the device fingerprint.
+# Bump QE_GEMM_KERNEL_SET_REV when GEMV device layouts/code or GEMM candidates change.
+file(GLOB_RECURSE QE_KERNEL_SET_FILES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.cu"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.cuh"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.h"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.hpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/*.inc")
+list(SORT QE_KERNEL_SET_FILES)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${QE_KERNEL_SET_FILES})
+set(QE_GEMM_KERNEL_SET_REV "1")
+set(QE_KERNEL_SET_MANIFEST "cuda_archs=${QE_ARCH_STR}\ngemm_device_rev=${QE_GEMM_KERNEL_SET_REV}\n")
+foreach(kernel_file IN LISTS QE_KERNEL_SET_FILES)
+  file(RELATIVE_PATH kernel_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${kernel_file}")
+  if(kernel_rel STREQUAL "src/kernels/gemm.cu")
+    file(READ "${kernel_file}" kernel_source)
+    set(begin_marker "// GEMM_TUNE_CACHE_BEGIN")
+    set(end_marker "// GEMM_TUNE_CACHE_END")
+    string(FIND "${kernel_source}" "${begin_marker}" kernel_begin)
+    string(FIND "${kernel_source}" "${end_marker}" kernel_end)
+    if(kernel_begin LESS 0 OR kernel_end LESS kernel_begin)
+      message(FATAL_ERROR "GEMM kernel-set markers missing from ${kernel_file}")
+    endif()
+    string(LENGTH "${end_marker}" end_length)
+    math(EXPR suffix_start "${kernel_end} + ${end_length}")
+    string(LENGTH "${kernel_source}" source_length)
+    math(EXPR suffix_length "${source_length} - ${suffix_start}")
+    string(SUBSTRING "${kernel_source}" 0 ${kernel_begin} kernel_prefix)
+    string(SUBSTRING "${kernel_source}" ${suffix_start} ${suffix_length} kernel_suffix)
+    set(kernel_source "${kernel_prefix}${kernel_suffix}")
+    string(REPLACE "#include \"../gemm_tune_key.h\"\n" "" kernel_source "${kernel_source}")
+    string(SHA256 kernel_hash "${kernel_source}")
+  elseif(kernel_rel STREQUAL "src/kernels/gemv.cuh")
+    set(kernel_hash "device-interface-rev-${QE_GEMM_KERNEL_SET_REV}")
+  else()
+    file(SHA256 "${kernel_file}" kernel_hash)
+  endif()
+  string(APPEND QE_KERNEL_SET_MANIFEST "${kernel_rel}:${kernel_hash}\n")
+endforeach()
+string(SHA256 QE_GEMM_KERNEL_SET_HASH "${QE_KERNEL_SET_MANIFEST}")
+add_compile_definitions(QE_GEMM_KERNEL_SET_HASH="${QE_GEMM_KERNEL_SET_HASH}")
 add_library(qengine SHARED ${KERNELS} src/capi.cpp src/config.cpp src/safetensors.cpp src/model.cpp src/dflash.cpp src/engine.cpp src/build_id.cpp)
 target_include_directories(qengine PUBLIC src)
 target_include_directories(qengine PRIVATE ${CMAKE_BINARY_DIR}/gen)
@@ -124,7 +166,7 @@ add_dependencies(qflash qe_build_id)
 
 # CPU unit tests of the comm rules and the exchange flag protocol (no GPU): ctest
 enable_testing()
-foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit disk_eager_unit qfn_pp_plan_unit load_drop_unit shared_prefix_unit df_adapt_unit mtp_share_unit host_pressure_unit slot_state_window_unit live_prefix_unit live_prefix_layout_unit live_prefix_driver_unit)
+foreach(t comm_rule_unit drv_gate_unit xchg_seq_unit sample_rng_unit archive_order_unit pool_order_unit kv_disk_unit disk_eager_unit qfn_pp_plan_unit load_drop_unit shared_prefix_unit df_adapt_unit mtp_share_unit host_pressure_unit slot_state_window_unit live_prefix_unit live_prefix_layout_unit live_prefix_driver_unit gemm_tune_key_unit)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/${t}.cpp)  # the Docker build stage has no tests/
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE src)
