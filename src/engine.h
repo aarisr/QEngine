@@ -279,7 +279,7 @@ private:
     size_t pool_tokens_ = 0;
     size_t pool_tokens0_ = 0;  // the start size (vram_tick grows back to it)
     size_t reserve_min_ = (size_t)1.5e9;  // the smallest card reserve (vram_tick's marks scale with it)
-    double vlast_ = 0, vhigh_since_ = 0;
+    double vlast_ = 0, vhigh_since_ = 0, vidle_last_ = 0;
     std::vector<qe_gpu_others::Watch> vwatch_;  // other processes' VRAM per card (gpu_others.h)
     unsigned long long n_room_ = 0;             // pool regrows (a paused slot retries after one, like after a release)
     double vregrow_t_ = 0;                      // the last regrow, and the others' largest growth then (hysteresis)

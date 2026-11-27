@@ -27,6 +27,7 @@ Everything else stays here.
 | 0028 | metrics: Prometheus series for speculative decoding, prompt-cache source, thinking tokens | cooking (better as an issue first; upstream has its own stats path) |
 | 0029 | server: reserve N slots for background requests (`QE_BG_RESERVED_SEQS`, default 0 = off); a waiting background request may park the newest interactive seq | fork-only for now (tied to our request-class header; candidate for a generic proposal later) |
 | 0030 | GEMM: reuse tables across builds keyed by model, GPU/card count, kernel-set hash and runtime setup; migrate only matching 1.6.2 legacy tables | QEngine build + CPU key/header/device-set tests passed; live no-retune confirmation awaits planned arm restart |
+| 0031 | 27b: idle VRAM poll gate (`QE_IDLE_POLL_S`, default 30, 0 = old behaviour): the server's 1/s `mem_guard` skips `vram_tick` (cudaMemGetInfo per card, NVML) while no sequence or prefill is active and the pool is not shrunk; steps and prefills still tick | cooking, unproven on production, ships as a bet (hypothesis: idle driver traffic holds the TP3 cards at P2; mechanism not measured); also gates the metrics NVML 1/s poll while no job is open; CPU test `idle_poll_unit`; revert with `QE_IDLE_POLL_S=0` |
 
 Dropped: 0024 (pinned/split archives to disk). Upstream fixed the same problem in 1.6.0 (#47) without a new file format.
 

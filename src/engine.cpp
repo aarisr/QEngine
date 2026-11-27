@@ -3,6 +3,7 @@
 #include "env.h"
 #include "engine.h"
 #include "drv_gate.h"
+#include "idle_poll.h"
 #include "kernels/watchdog.cuh"
 #include "kernels/gemv.cuh"
 #include "gpu_others.h"
@@ -2403,7 +2404,12 @@ size_t Engine::ram_budget() {
 // memory pressure from outside (another process grew): below the margin, free pinned slabs go back to the host
 // first, then archives in ram_make_room's order
 void Engine::mem_guard(bool vram) {
-    if (vram) vram_tick();  // (also when idle: the server calls this every second; a shrunk pool grows back without requests, H1)
+    if (vram) {  // [idle-power] idle: the VRAM poll at QE_IDLE_POLL_S (30 s; 0: every call); steps and prefills tick themselves
+        static const double idle_every = env_int("QE_IDLE_POLL_S", 30);
+        bool idle = pfs_.empty();
+        for (const Seq& x : seqs_) idle = idle && !x.active;
+        if (qe_idle_poll::due(idle, pool_tokens_ < pool_tokens0_, vnow_s(), &vidle_last_, idle_every)) vram_tick();
+    }  // (also when idle: the server calls this every second; a shrunk pool grows back without requests, H1)
     mem_pressure();
     if (!qe_hostmem::deficit()) return;
     {  // pre-pinned snapshot buffers not in use go back first (taken again on demand while the host has room, review M2)

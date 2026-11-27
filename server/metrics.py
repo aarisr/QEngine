@@ -208,11 +208,18 @@ class Metrics:
         except Exception:
             pass
         last_save = time.time()
+        idle_every = env_int("QE_IDLE_POLL_S", 30)  # [idle-power] NVML while nothing runs: every N s (0: every second)
+        last_nvml = last_power = 0.0
         while True:
             time.sleep(1.0 - (time.time() % 1.0))
             now = time.time()
             gpus, power = [], 0.0
-            if nv:
+            with self.lock:
+                busy = bool(self.jobs)
+            if nv and not busy and idle_every > 0 and now - last_nvml < idle_every:
+                gpus, power = self.gpus, last_power  # (the last reading: no driver traffic on an idle card)
+            elif nv:
+                last_nvml = now
                 try:
                     for i in range(nv.nvmlDeviceGetCount()):
                         h = nv.nvmlDeviceGetHandleByIndex(i)
@@ -233,6 +240,7 @@ class Metrics:
                     pass
             with self.lock:
                 self.gpus = gpus
+                last_power = power
                 c = self.cur
                 c["power"] = power
                 c["active"] = sum(1 for j in self.jobs.values() if j["state"] != "queued")
