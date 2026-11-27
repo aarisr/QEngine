@@ -13,9 +13,11 @@ int main() {
     EXPECT(!due(true, false, 131.0, &last, 30));
     EXPECT(due(false, false, 131.5, &last, 30));   // work: always
     EXPECT(due(true, true, 131.6, &last, 30));     // shrunk pool: always
+    EXPECT(!due(true, false, 131.7, &last, 0));    // 0 (default): no idle heartbeat, no GPU call while idle
+    EXPECT(!due(true, false, 9999.0, &last, 0));
+    EXPECT(due(false, false, 10000.0, &last, 0));  // work: still always (vram_tick's own 200 ms gate limits it)
+    EXPECT(due(true, true, 10000.1, &last, 0));    // a shrunk pool keeps its cadence at 0 too
     EXPECT(last == 130.0);
-    EXPECT(due(true, false, 131.7, &last, 0));     // 0: the old behaviour
-    EXPECT(due(true, false, 131.8, &last, 0));
     puts("idle_poll_unit ok");
     return 0;
 }

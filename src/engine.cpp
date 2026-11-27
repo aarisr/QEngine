@@ -1172,6 +1172,7 @@ void Engine::pack_up_above(int s) {
 bool Engine::ensure_cap(int s, int need, const std::vector<int>& protect, Room mode) {
     if (need > max_ctx_) return false;
     if (seqs_[s].max_t >= need) return true;
+    vram_tick();  // [event-poll] KV growth: memory pressure is read before the pool is asked for more (200 ms gate inside)
     finish();
     const int want = round_cap(need), floor = min_cap(need);
     if (try_grow(s, want)) return true;
@@ -2404,8 +2405,8 @@ size_t Engine::ram_budget() {
 // memory pressure from outside (another process grew): below the margin, free pinned slabs go back to the host
 // first, then archives in ram_make_room's order
 void Engine::mem_guard(bool vram) {
-    if (vram) {  // [idle-power] idle: the VRAM poll at QE_IDLE_POLL_S (30 s; 0: every call); steps and prefills tick themselves
-        static const double idle_every = env_int("QE_IDLE_POLL_S", 30);
+    if (vram) {  // [event-poll] idle: no GPU call (QE_IDLE_POLL_S: optional heartbeat, 0 = none); work, admission, KV growth tick themselves
+        static const double idle_every = env_int("QE_IDLE_POLL_S", 0);
         bool idle = pfs_.empty();
         for (const Seq& x : seqs_) idle = idle && !x.active;
         if (qe_idle_poll::due(idle, pool_tokens_ < pool_tokens0_, vnow_s(), &vidle_last_, idle_every)) vram_tick();
@@ -4058,6 +4059,7 @@ int Engine::start_begin(const int* ids, int n, int k, unsigned long long affinit
     // a batched step queued ahead for the running sequences stays: it finishes before this
     // prompt's chunks on the same streams and the next step_batch returns its tokens
     finish_single();
+    vram_tick();  // [event-poll] admission: the pool is checked against the cards before the new request takes KV
     CHECK((int)pfs_.size() < kMaxPrefills, "start_begin: %zu prefills already in progress", pfs_.size());
     {
         int cnt = 0;

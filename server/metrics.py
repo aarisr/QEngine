@@ -6,7 +6,7 @@ JSON file every 30 s and at shutdown). Everything is served on a separate fixed 
   /               live dashboard (server/dashboard.html)
   /api/stats      JSON snapshot            /api/stream   the same as server-sent events (2 Hz)
   /metrics        Prometheus text format
-The scheduler thread reports events (cheap host-side bookkeeping); a 1 Hz thread polls NVML."""
+The scheduler thread reports events (cheap host-side bookkeeping); NVML is read on scrape only (QE_NVML_CACHE_S)."""
 import collections
 import json
 import os
@@ -58,6 +58,11 @@ class Metrics:
         self.gpus = []
         self.step_ms = collections.deque(maxlen=200)
         self._energy = {}
+        self._nv = None
+        self._nvml_lock = threading.Lock()
+        self._nvml_last = 0.0
+        self._nvml_ttl = env_int("QE_NVML_CACHE_S", 5)
+        self._power = 0.0
         self._busy_since = None
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -195,54 +200,75 @@ class Metrics:
         with self.lock:
             self.engine = info
 
-    # ------------------------------------------------------------ background: NVML + buckets
+    # ------------------------------------------------------------ NVML on scrape, background buckets
+    @staticmethod
+    def nvml_due(have, busy, now, last, ttl):
+        """[event-poll] read NVML now? The first scrape reads once; an idle engine then serves the cache (no driver traffic on an idle card); a busy one refreshes at
+        most every ttl seconds (ttl <= 0: every scrape)."""
+        if not have:
+            return True
+        if not busy:
+            return False
+        return ttl <= 0 or now - last >= ttl
+
+    def _nvml_open(self):
+        if self._nv is None:
+            try:
+                import warnings
+                with warnings.catch_warnings():  # "pynvml is deprecated" (it still works)
+                    warnings.simplefilter("ignore")
+                    import pynvml
+                pynvml.nvmlInit()
+                self._nv = pynvml
+            except Exception:
+                self._nv = False
+        return self._nv
+
+    def sample_gpus(self, now=None):
+        """The GPU readings for a scrape (/metrics, /api/stats, the stream): cached for QE_NVML_CACHE_S (5), and while no job
+        is open the last reading is served without touching NVML."""
+        now = time.time() if now is None else now
+        with self._nvml_lock:
+            with self.lock:
+                busy = bool(self.jobs)
+                have = self._nvml_last > 0
+            if not self.nvml_due(have, busy, now, self._nvml_last, self._nvml_ttl):
+                return
+            nv = self._nvml_open()
+            if not nv:
+                return
+            self._nvml_last = now
+            gpus, power = [], 0.0
+            try:
+                for i in range(nv.nvmlDeviceGetCount()):
+                    h = nv.nvmlDeviceGetHandleByIndex(i)
+                    m = nv.nvmlDeviceGetMemoryInfo(h)
+                    u = nv.nvmlDeviceGetUtilizationRates(h)
+                    p = nv.nvmlDeviceGetPowerUsage(h) / 1000
+                    e = nv.nvmlDeviceGetTotalEnergyConsumption(h) / 1000  # J since driver load (a delta over any gap)
+                    with self.lock:
+                        if i in self._energy:
+                            self.session["energy_j"] += max(e - self._energy[i], 0)
+                        self._energy[i] = e
+                    gpus.append({"i": i, "mem": m.used, "mem_total": m.total, "util": u.gpu,
+                                 "power": p, "limit": nv.nvmlDeviceGetEnforcedPowerLimit(h) / 1000,
+                                 "temp": nv.nvmlDeviceGetTemperature(h, 0),
+                                 "clock": nv.nvmlDeviceGetClockInfo(h, 1)})
+                    power += p
+            except Exception:
+                pass
+            with self.lock:
+                self.gpus = gpus
+                self._power = power
+
     def _loop(self):
-        nv = None
-        try:
-            import warnings
-            with warnings.catch_warnings():  # "pynvml is deprecated" (it still works)
-                warnings.simplefilter("ignore")
-                import pynvml
-            pynvml.nvmlInit()
-            nv = pynvml
-        except Exception:
-            pass
         last_save = time.time()
-        idle_every = env_int("QE_IDLE_POLL_S", 30)  # [idle-power] NVML while nothing runs: every N s (0: every second)
-        last_nvml = last_power = 0.0
         while True:
             time.sleep(1.0 - (time.time() % 1.0))
             now = time.time()
-            gpus, power = [], 0.0
             with self.lock:
-                busy = bool(self.jobs)
-            if nv and not busy and idle_every > 0 and now - last_nvml < idle_every:
-                gpus, power = self.gpus, last_power  # (the last reading: no driver traffic on an idle card)
-            elif nv:
-                last_nvml = now
-                try:
-                    for i in range(nv.nvmlDeviceGetCount()):
-                        h = nv.nvmlDeviceGetHandleByIndex(i)
-                        m = nv.nvmlDeviceGetMemoryInfo(h)
-                        u = nv.nvmlDeviceGetUtilizationRates(h)
-                        p = nv.nvmlDeviceGetPowerUsage(h) / 1000
-                        e = nv.nvmlDeviceGetTotalEnergyConsumption(h) / 1000  # J since driver load
-                        with self.lock:
-                            if i in self._energy:
-                                self.session["energy_j"] += max(e - self._energy[i], 0)
-                            self._energy[i] = e
-                        gpus.append({"i": i, "mem": m.used, "mem_total": m.total, "util": u.gpu,
-                                     "power": p, "limit": nv.nvmlDeviceGetEnforcedPowerLimit(h) / 1000,
-                                     "temp": nv.nvmlDeviceGetTemperature(h, 0),
-                                     "clock": nv.nvmlDeviceGetClockInfo(h, 1)})
-                        power += p
-                except Exception:
-                    pass
-            with self.lock:
-                self.gpus = gpus
-                last_power = power
                 c = self.cur
-                c["power"] = power
+                c["power"] = self._power  # (the last scrape's reading: the loop makes no GPU call)
                 c["active"] = sum(1 for j in self.jobs.values() if j["state"] != "queued")
                 c["queued"] = sum(1 for j in self.jobs.values() if j["state"] == "queued")
                 if c["active"]:
@@ -287,7 +313,9 @@ class Metrics:
                     active[j.get("class", "interactive")] += 1
             return active
 
-    def snapshot(self):
+    def snapshot(self, sample=True):
+        if sample:
+            self.sample_gpus()
         now = time.time()
         with self.lock:
             s = dict(self.session)
@@ -323,7 +351,7 @@ class Metrics:
 
     def save(self):
         try:
-            snap = self.snapshot()
+            snap = self.snapshot(sample=False)
             g = snap["global"]
             g["records"] = snap["records"]
             g["runs"] = self.runs
