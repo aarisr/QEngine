@@ -3,6 +3,7 @@
 #include "archive_tiers.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -41,6 +42,91 @@ static void rm_dir(const std::string& d) {
         closedir(dir);
     }
     rmdir(d.c_str());
+}
+
+// characterization: reset_objects forgets the objects, the files stay, the tier and the eviction counters are kept
+static void test_reset_objects() {
+    TieredStore s;
+    const int64_t now = 1000000;
+    s.clock = [&] { return now; };
+    const std::string d = mkdtemp_dir("ro");
+    const int t = s.add_tier("ram", d, true, 250);
+    std::string blob(100, 'x');
+    EXPECT(s.put(t, "k1.qkv", blob.data(), 100, 0x71));
+    EXPECT(s.put(t, "k2.qkv", blob.data(), 100, 0x72));
+    EXPECT(s.put(t, "k3.qkv", blob.data(), 100, 0x73));  // the third over the 250 cap: the first is evicted
+    EXPECT(s.tier(t).evictions == 1 && s.tier(t).objects == 2);
+    s.reset_objects();
+    EXPECT(s.tier(t).objects == 0 && s.tier(t).bytes == 0);  // the objects are forgotten
+    EXPECT(s.tier(t).evictions == 1);  // the eviction counter is kept
+    EXPECT(s.tiers() == 1 && s.find_tier("ram") == 0);  // the tier is kept
+    EXPECT(!s.has(d + "/k2.qkv") && !s.has(d + "/k3.qkv"));
+    EXPECT(access((d + "/k2.qkv").c_str(), F_OK) == 0 && access((d + "/k3.qkv").c_str(), F_OK) == 0);  // the files stay
+    int files = 0;
+    EXPECT(dir_bytes(d, &files) == 200 && files == 2);
+    rm_dir(d);
+}
+
+// characterization: get returns the registered object, or nullptr when absent
+static void test_get() {
+    TieredStore s;
+    const int64_t now = 1000000;
+    s.clock = [&] { return now; };
+    const std::string d = mkdtemp_dir("gt");
+    const int t = s.add_tier("ram", d, true, 10000);
+    std::string blob(100, 'x');
+    EXPECT(s.put(t, "g1.qkv", blob.data(), 100, 0x81, 1234));
+    const qe_archive_store::Obj* o = s.get(d + "/g1.qkv");
+    EXPECT(o != nullptr && o->tier == t && o->bytes == 100 && o->session == 0x81 && o->expires == now + 1234 && o->seq == 1);
+    EXPECT(s.get(d + "/nope.qkv") == nullptr);
+    rm_dir(d);
+}
+
+// characterization: evict runs the LRU loop until the tier fits, and returns the evicted count
+static void test_evict_count() {
+    TieredStore s;
+    const int64_t now = 1000000;
+    s.clock = [&] { return now; };
+    const std::string d = mkdtemp_dir("ev");
+    const int t = s.add_tier("ram", d, true, 250);
+    std::string blob(100, 'x');
+    for (int i = 1; i <= 3; i++) EXPECT(s.put(t, "e" + std::to_string(i) + ".qkv", blob.data(), 100, 0));
+    EXPECT(s.tier(t).objects == 2 && s.tier(t).evictions == 1);  // the third put already evicted e1
+    EXPECT(s.evict(t, 150) == 1);  // 200 + 150 > 250: e2 goes, then it fits
+    EXPECT(s.tier(t).objects == 1 && s.tier(t).evictions == 2 && !s.has(d + "/e2.qkv"));
+    EXPECT(s.evict(t, 0) == 0);  // already fits: nothing goes
+    EXPECT(s.tier(t).objects == 1 && s.tier(t).evictions == 2);
+    EXPECT(s.evict(t, 1000) == 1);  // evicts until the tier is empty and returns the count
+    EXPECT(s.tier(t).objects == 0 && s.tier(t).evictions == 3);
+    int files = 0;
+    EXPECT(dir_bytes(d, &files) == 0 && files == 0);
+    rm_dir(d);
+}
+
+// characterization: delete_session goes through the private unlink_remove: the file is unlinked and the index entry gone
+static void test_delete_session_remove_path() {
+    TieredStore s;
+    const int64_t now = 1000000;
+    s.clock = [&] { return now; };
+    const std::string d = mkdtemp_dir("ds");
+    const int t = s.add_tier("ram", d, true, 10000);
+    std::string blob(100, 'x');
+    EXPECT(s.put(t, "s1.qkv", blob.data(), 100, 0x91));
+    // a second object of the same session, registered the way the restore does (a put would supersede s1)
+    const int fd = ::open((d + "/s2.qkv").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    EXPECT(fd >= 0 && ::write(fd, blob.data(), blob.size()) == (ssize_t)blob.size());
+    ::close(fd);
+    qe_archive_store::Obj o;
+    o.tier = t, o.bytes = 100, o.session = 0x91;
+    s.add(d + "/s2.qkv", o);
+    EXPECT(s.put(t, "s3.qkv", blob.data(), 100, 0x92));
+    EXPECT(s.session_paths(0x91).size() == 2);
+    EXPECT(s.delete_session(0x91) == 2);
+    EXPECT(!s.has(d + "/s1.qkv") && !s.has(d + "/s2.qkv") && s.has(d + "/s3.qkv"));
+    EXPECT(access((d + "/s1.qkv").c_str(), F_OK) != 0 && access((d + "/s2.qkv").c_str(), F_OK) != 0);
+    EXPECT(s.tier(t).objects == 1 && s.tier(t).bytes == 100 && s.tier(t).evictions == 0);  // a delete is not an eviction
+    EXPECT(s.delete_session(0x91) == 0);  // the session is empty: nothing to delete
+    rm_dir(d);
 }
 
 int main() {
@@ -157,6 +243,12 @@ int main() {
         EXPECT(rows.size() == 2 && s5.tier(t5).objects == 2);
         rm_dir(d5);
     }
+
+    // characterization: the methods the coverage file marks uncovered, one test function each
+    test_reset_objects();
+    test_get();
+    test_evict_count();
+    test_delete_session_remove_path();
 
     for (const auto& d : {ram, nvme, d2, d3}) rm_dir(d);
     if (fails) return 1;
