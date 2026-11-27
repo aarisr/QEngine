@@ -336,6 +336,9 @@ int qe_last_from_archive(void* e) { return ((Engine*)e)->last_from_archive(); }
 int qe_num_archives(void* e) { return ((Engine*)e)->num_archives(); }
 int qe_num_disk_archives(void* e) { return ((Engine*)e)->num_disk_archives(); }
 void qe_persist(void* e) { ((Engine*)e)->persist(); }
+long long qe_archive_flush(void* e, long long max_bytes) {
+    return max_bytes > 0 ? (long long)((Engine*)e)->flush_archives((size_t)max_bytes) : 0;
+}
 void qe_set_dump_hidden(void* e, uint16_t* out) { ((Engine*)e)->set_dump_hidden(out); }
 void qe_release(void* e, int slot) { QE_STEP_CALL; ((Engine*)e)->release(slot); }
 // [srv-disconnect] the client of the slot's prompt in flight left: the release that follows keeps the rows done

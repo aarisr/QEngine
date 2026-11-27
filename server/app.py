@@ -2336,17 +2336,13 @@ class Generator:
                         finally:
                             self.cv.acquire()
                         continue
-                    # long idle: save the conversations to the disk cache (they then survive a
-                    # restart / model swap even without a clean shutdown)
-                    # (waited in slices of at most HANG_S / 2 with a beat in between: --persist-idle above QE_HANG_S
-                    # must not look like a hang)
-                    # an archiver stopped for host memory retries once a second here too, also while the disk
-                    # persist waits for --persist-idle (qfn_archive_loss re-review L1)
+                    # Flash-Next retains optional idle persistence. Qwen3.8-27B writes only via the bounded local
+                    # archive flush endpoint or the pre-stop persist, never continuously while serving.
                     if bg_done == 2 and time.time() - last_mg > 1.0:
                         last_mg = time.time()
                         bg_done = False
                         continue
-                    if self.dirty and idle_persist > 0 and self.args.disk_cache:
+                    if self.args.profile.is_flash and self.dirty and idle_persist > 0 and self.args.disk_cache:
                         if idle_since is None:
                             idle_since = time.monotonic()
                         rest = idle_persist - (time.monotonic() - idle_since)
@@ -4223,6 +4219,32 @@ def build_app(gen: Generator, args):
     async def health():
         return {"status": "ok"}
 
+    @app.post("/admin/archive/flush")
+    async def flush_archive(req: Request):
+        if args.profile.is_flash:
+            return JSONResponse({"error": "archive flush is Qwen3.8-27B only"}, status_code=404)
+        client = req.client
+        if not client or client.host not in ("127.0.0.1", "::1"):
+            return JSONResponse({"error": "loopback only"}, status_code=403)
+        if not args.disk_cache:
+            return JSONResponse({"error": "no persistent archive directory is configured"}, status_code=503)
+        try:
+            body = await req.json()
+        except Exception:
+            return JSONResponse({"error": "expected a JSON body"}, status_code=400)
+        if not isinstance(body, dict) or body.get("directory") != args.disk_cache:
+            return JSONResponse({"error": "directory must match the configured --disk-cache path"}, status_code=400)
+        max_bytes = body.get("max_bytes")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 0 < max_bytes <= (128 << 30):
+            return JSONResponse({"error": "max_bytes must be an integer in 1..137438953472"}, status_code=400)
+        result = {}
+
+        def flush():
+            result["bytes"] = gen.engine.flush_archives(max_bytes)
+
+        await asyncio.to_thread(gen.run_on_engine, flush)
+        return {"directory": args.disk_cache, "written_bytes": result.get("bytes", 0)}
+
     def limits():
         """What a client needs to size its requests (vLLM / llama.cpp field names where they exist)."""
         e = gen.engine
@@ -5097,12 +5119,11 @@ def parse_args(argv=None):
                     help="all-time monitoring totals (dashboard)")
     ap.add_argument("--disk-cache-gb", type=float, default=200)
     ap.add_argument("--persist-idle", type=float, default=120,
-                    help="seconds idle before live conversations are saved to the disk cache")
+                    help="Flash-Next only: seconds idle before live conversations are saved to its disk cache; "
+                         "Qwen3.8-27B writes on explicit flush or shutdown")
     ap.add_argument("--disk-eager", action="store_true",
-                    help="with --disk-cache (Qwen3.8-27B / Flash-Next): write each conversation to the disk cache in the "
-                         "background right after every finished reply (a kill -9 then keeps the last turn), instead of "
-                         "only at --persist-idle and at shutdown. Off by default: it writes the whole conversation file "
-                         "after every turn (NVMe wear)")
+                    help="Flash-Next: write each conversation after every reply instead of only at --persist-idle and shutdown; "
+                         "Qwen3.8-27B ignores this flag and writes only on explicit flush or shutdown")
     ap.add_argument("--log-file", default=env_str("QE_LOG_FILE", "auto"),
                     help="persistent log: the server's whole output (also the engine's) is appended to this file with "
                          "a timestamp per line and survives crashes and restarts (auto: "
@@ -5190,8 +5211,8 @@ def parse_args(argv=None):
     os.environ.pop("FLASH_DISK_CACHE", None)
     os.environ.pop("FLASH_DISK_EAGER", None)
     os.environ.pop("QE_DISK_EAGER", None)
-    if args.disk_cache and args.disk_eager and not args.profile.is_flash:  # (27B: engine.cpp disk_eager_)
-        os.environ["QE_DISK_EAGER"] = "1"
+    if args.disk_cache and args.disk_eager and not args.profile.is_flash:
+        print("[settings] --disk-eager is ignored for Qwen3.8-27B; its archive writes are event-triggered", flush=True)
     if args.disk_cache and args.profile.is_flash:
         os.environ["FLASH_DISK_CACHE"] = args.disk_cache
         os.environ["FLASH_DISK_CACHE_GB"] = str(args.disk_cache_gb)

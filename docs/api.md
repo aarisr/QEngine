@@ -306,10 +306,9 @@ monitor `server/qetop.py`. Both show the running version and build in the header
 - **Pinned system prompts**: the KV and state at the end of each agent kind's system prompt and tools are kept apart
   from the archive (`FLASH_PREFIX_GB` / `QE_PREFIX_GB`, 8 GB), so a new agent of that kind starts after its system
   prompt even when the archive is full.
-- There is no disk cache by default. With `--disk-cache DIR` (both models, 200 GB at most, `--disk-cache-gb`) conversations
-  are also written to files and survive a restart: a conversation that returns is read back instead of recomputed. Flash-Next
-  has it since 1.3.5.3, experimental; details in
-  [docs/advanced.md](advanced.md#disk-cache). A failing disk costs only the cache; the server keeps serving. Files are
-  written at `--persist-idle` (120 s idle) and at shutdown, so this covers a graceful restart; the opt-in `--disk-eager` also
-  writes after every reply (survives a `kill -9`, at the cost of rewriting the file every turn). On the 27B a conversation
-  that shares a pinned system prompt is saved together with it, so each file restores on its own.
+- There is no disk cache by default. `--disk-cache DIR` enables persisted archives. Qwen3.8-27B writes only on the
+  loopback `POST /admin/archive/flush` (directory and byte budget required) or pre-stop shutdown; Flash-Next retains
+  idle writes and has been experimental since 1.3.5.3. Details:
+  [docs/advanced.md](advanced.md#disk-cache). A failing disk costs only the cache; the server keeps serving.
+  Qwen's `--disk-cache-gb`, `--persist-idle` and `--disk-eager` do not apply.
+  On the 27B a conversation sharing a pinned system prompt is saved together with it, so each file restores on its own.

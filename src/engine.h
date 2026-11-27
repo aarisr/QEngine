@@ -183,11 +183,12 @@ public:
     bool last_from_archive() const { return last_from_archive_; }
     int num_archives() const { return archives_.size(); }
     int num_disk_archives() const;
-    // Archive every live slot (and wait for the disk writes): before shutdown / when idle.
+    // Archive every live slot (and write the configured store) during shutdown.
     void persist();
-    // Archive idle conversations to host memory piece by piece (about `budget` bytes per GPU
-    // per call), so that evicting them later costs nothing on the request path: the server
-    // calls it when nothing runs. true when nothing is left to archive.
+    // Persist the hottest archived checkpoints first, up to `max_bytes`, to QE_DISK_CACHE.
+    size_t flush_archives(size_t max_bytes);
+    // Archive idle conversations to host memory piece by piece (about `budget` bytes per GPU per call), so evicting them
+    // later costs nothing on the request path; the server calls it when nothing runs. true when no work remains.
     bool archive_more(size_t budget);
     int last_slot() const { return cur_; }
     int num_slots() const { return seqs_.size(); }
@@ -631,7 +632,8 @@ private:
         std::vector<size_t> sizes;          // per GPU
         size_t total = 0;
         std::shared_ptr<Bufs> ram;          // null: on disk only
-        std::string path;                   // non-empty: on disk (or being written)
+        bool disk_readonly = false;          // a sibling arm's file: indexed and mapped, never touched by this arm
+        std::string path;                   // non-empty: in the write store, sibling store, or pending writer
         std::shared_ptr<DiskState> disk;
         size_t data_off = 0;                // file offset of GPU 0's buffer
         unsigned long long used = 0, born = 0;  // born: tick when made (0: found on disk at start)
@@ -647,7 +649,7 @@ private:
         // > 0: a start() is restoring from it; making room (prefix materialization, ensure_cap
         // evictions archiving other slots) must not drop it before its rows / state are copied
         mutable int hold = 0;
-        long long sk = -1;                  // steering key of its KV / states (set_steering); steered ones stay in RAM
+        long long sk = -1;                  // steering key is serialized in QKVA0004; older files are unsteered
         // [gh47] a split archive's file is written flat (split 0: rows [0, split) from the pinned copy, its state at the
         // split one more checkpoint): the file's layout while the entry is split (empty: the file's layout is the entry's
         // own). The entry takes it when its memory copy goes (arch_drop_ram)
@@ -693,7 +695,8 @@ private:
     struct ArchSub { int pos; std::vector<const char*> src; std::shared_ptr<Bufs> hold; bool whole; };  // whole: hold is its archive's buffer
     void stage_subs(std::vector<ArchSub>& subs);
     std::vector<ArchSub> archive_subs(const Seq& q, int n);
-    void drop_covered(long long sk, const int* toks, int n, unsigned long long born_after, bool keep_files = false);
+    void drop_covered(long long sk, const int* toks, int n, unsigned long long born_after, bool keep_files = false,
+                      const KvArchive* exclude = nullptr);
     static bool arch_present(const KvArchive& a);     // memory copy, or a file written / being written
     static bool arch_file_ready(const KvArchive& a);  // its file is written
     bool bg_prepare(int slot);
@@ -733,7 +736,7 @@ private:
     bool press_wait_logged_ = false;
     void mem_pressure();
     qe_memp::Policy::Result press_act(int s, size_t step, std::string& what);
-    void disk_make_room(size_t need);
+    bool disk_make_room(size_t need);
     void disk_forget(KvArchive& a);
     bool archive_load(KvArchive& a);
     void disk_init();
@@ -742,6 +745,7 @@ private:
     void disk_writer();
     std::string model_dir_, fingerprint_, disk_dir_;
     size_t disk_budget_ = 0, disk_used_ = 0;
+    std::atomic<size_t> disk_restore_hits_{0}, disk_evictions_{0};
     struct DiskJob {
         std::shared_ptr<Bufs> ram;
         std::vector<size_t> sizes;

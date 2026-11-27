@@ -73,6 +73,7 @@ SIGS = {
     "qe_archive_more": (c_int, [c_void_p, c_i64]),
     "qe_persist": (None, [c_void_p]),
     "qe_num_archives": (c_int, [c_void_p]),
+    "qe_archive_flush": (c_i64, [c_void_p, c_i64]),
     "qe_num_disk_archives": (c_int, [c_void_p]),
     "qe_disk_flush": (c_int, [c_void_p, ctypes.c_double]),
     "qe_last_copied": (c_int, [c_void_p]),
@@ -626,9 +627,13 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         return self.lib.qe_num_disk_archives(self.h) if "qe_num_disk_archives" in self.fns else 0
 
     def persist(self):
-        """Archive every live slot (memory + disk cache). 27B: waits for the disk writes; Flash-Next: disk_flush waits."""
+        """Archive and persist every live slot during shutdown."""
         if "qe_persist" in self.fns:
             self.lib.qe_persist(self.h)
+
+    def flush_archives(self, max_bytes):
+        """Persist up to max_bytes from the hottest archived checkpoints to QE_DISK_CACHE."""
+        return self.lib.qe_archive_flush(self.h, int(max_bytes)) if "qe_archive_flush" in self.fns else 0
 
     def disk_flush(self, seconds):
         """Flash-Next: persist() only queues the files; wait for them, at most `seconds`. True: all written."""
@@ -699,7 +704,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             else:
                 slots.append({"off": 0, "cap": self.max_t, "pos": 0, "active": i in self._active, "used": 0, "prio": 1,
                               "paused": False})
-        a = (ctypes.c_double * 6)()
+        a = (ctypes.c_double * 7)()
         if "qe_archive_info" in self.fns:
             L.qe_archive_info(h, a)
         c = (ctypes.c_longlong * 6)()  # grow, move, evict, pause, resume, paused now
@@ -719,7 +724,7 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
                               "idle_s": round(r[3] / 1000.0, 1) if r[3] >= 0 else None, "generating": bool(r[5])})
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots, "conversations": cl,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
-                             "pinned_bytes": a[4], "pinned_used": a[5]},
+                             "pinned_bytes": a[4], "pinned_used": a[5], "disk_evictions": int(a[6])},
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
                 "paused": c[5], "parked_interactive_total": bg_pause_count[0],
                 "parked_seconds_total": bg_pause_seconds[0]}

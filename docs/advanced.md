@@ -708,7 +708,7 @@ for its drafter).
 | `--stats-file` | `~/.cache/qengine/stats.json` | all-time monitoring totals |
 | `--metrics-host` | `127.0.0.1` | address the monitoring port listens on (the Docker image sets `0.0.0.0` inside the container) |
 | `--engine-lib` / `QE_LIB` | `build/libqengine.so` (27B), `build/libqflash.so` (Flash-Next), `build/libqglm.so` (GLM-5.3-Flash), `build_gptoss/libqgptoss.so` (gpt-oss-120B), `build_srv/libqinkling.so` (Inkling-2-Mini); DeepSeek-V4.1-Flash: `QE_DSV4_LIB` | the engine shared library to load |
-| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache (both models; Flash-Next: see [Disk cache](#disk-cache)), its size, and the idle seconds before live conversations are saved; on the 27B, steered conversations are not saved, and a conversation attached to a shared system prompt (`QE_SHARE_PREFIX=1`, the default) is saved with that system prompt in its own file (each file restores alone; it is larger by the system prompt's rows: 0.41 GB for a 7K-token system prompt on one card, so a 7K-token conversation file is about 0.75 GB). `--disk-eager` writes after every reply (see [Disk cache](#disk-cache)). The flag also moves the start-up cache there. `QE_DISK_CACHE` alone (without the flag) turns the 27B's persistent prompt cache on in that directory (size `QE_DISK_CACHE_GB`, `200`); on Flash-Next it moves only the start-up cache |
+| `--disk-cache DIR`, `--disk-cache-gb`, `--persist-idle` | off, `200`, `120` | persistent prompt cache: Qwen3.8-27B writes on the loopback flush endpoint or shutdown (`--disk-cache-gb` and `--persist-idle` do not apply); Flash-Next retains its idle persistence, see [Disk cache](#disk-cache) |
 
 Per-request statistics lines, e.g.:
 
@@ -823,16 +823,14 @@ Flash-Next, what it does:
 - **When the disk fails.** A directory it can't write, a full disk or a write error costs only the cache. A warning goes to
   the log and the server keeps serving. After a failed write, it tries again after a minute, then less often.
 
-**`--disk-eager` (opt-in, Qwen3.8-27B and Flash-Next).** With `--disk-cache`, each conversation is also written right after
-every finished reply: the server copies it to the host archive while it is idle and the file goes to the background writer.
-Requests are not held up (the copy runs between requests in small pieces; the write is off the request path): in a tight
-agent loop at ~106K tokens the time to first token stayed at 0.09 s on Flash-Next (3 cards) and 0.08 s on the 27B at 33K.
-At most one write per conversation runs at a time; a newer one waits and replaces a queued older one, so back-to-back
-turns write about every other turn on Flash-Next (2.2 GB per file at 106K); the 27B with half-second tool gaps wrote a
-file after every turn (1.8 GB at 33K, 0.2 s after the reply). A `kill -9` after that keeps the last turn. At most 8
-writes wait in the queue; past that a conversation keeps its previous file and the newer one is written at the next
-save. The old file of a conversation is deleted only after its newer file is on the drive. The cost is disk wear: the whole conversation file is rewritten after every turn (several GB per turn for
-a long agent session), which is why it is off by default.
+**Qwen3.8-27B.** Writes are event-triggered: a loopback `POST /admin/archive/flush` or pre-stop shutdown. The endpoint requires
+`{"directory": "<configured --disk-cache path>", "max_bytes": N}` and writes hottest archived checkpoints first, within `N`.
+`--disk-eager` and `--persist-idle` are ignored for the 27B. The configured `--disk-cache` is the only writable directory;
+semicolon-separated `QE_DISK_CACHE_READ_DIRS` are read-only, and paths under `/dev/shm/` are restored before NVMe paths.
+The `/dev/shm/` writer cap is 16 GiB; other writer paths use 1.25 × (KV pool + archive budget + pinned-prefix budget).
+NVMe writes are skipped if filesystem use would exceed 85%. Startup removes local temp files, fingerprint-mismatched
+objects, malformed archives and files older than seven days. Archives keep QKVA checksums and only the latest flushed
+checkpoint for a matching token prefix is retained. A failed write costs only the cache; serving continues.
 
 Not covered: conversations that didn't fit the host archive are not written, a file is rewritten whole each time, and
 one server per directory (a second one runs without the cache and says so).

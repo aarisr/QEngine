@@ -199,8 +199,8 @@ request of that server, short ones too, so run a separate server for long docume
 | `QE_PAUSE_TIMEOUT_S` | `900` | seconds a reply may wait for GPU memory another process holds before it ends with an error, counted from when that wait began: one that cannot continue, or a paused one that cannot resume because the KV cache gave memory back; a reply paused only to make room for another start has no deadline |
 | `QE_DECODE_COMM` | `auto` | decode collectives: `auto` (timed on real decode steps at start-up, cached; keeps P2P or the host path per mode), `remeasure`, `p2p`, `host`; as on [Flash-Next](qwen3.8-flash-next.md#settings) |
 | `QE_HOST_RESERVE_GB` | max(8, 8 % of RAM) | at start only: RAM the host-RAM plan leaves to the system and the desktop when it sizes the archive and the pinned prompts |
-| `--disk-cache DIR` | off | persistent prompt cache that survives restarts (Flash-Next: experimental, since 1.3.5.3) |
-| `--disk-eager` | off | with `--disk-cache`: also write each conversation after every reply (NVMe wear: the whole file per turn) |
+| `--disk-cache DIR` | off | persistent Qwen3.8-27B archive store; writes only on a loopback flush request or shutdown |
+| `--disk-eager` | ignored | Qwen3.8-27B persists only on explicit flush/shutdown; `--persist-idle` is Flash-Next only |
 
 ## Benchmarks
 
