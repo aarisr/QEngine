@@ -4178,11 +4178,9 @@ bool tune_read_file(const std::string& path, const std::string& expected_header,
         std::string current;
         for (const auto& h : header) current += h + "\n";
         if (current == expected_header) return true;
-        if (allow_legacy && header.size() >= 2 && header[0] == "qengine-gemm-tune 1" &&
-            header[1].rfind("built ", 0) == 0) {
-            std::string old_setup;
-            for (size_t i = 2; i < header.size(); ++i) old_setup += header[i] + "\n";
-            if (old_setup == legacy_setup) { imported_legacy = true; return true; }
+        if (allow_legacy && gemm_tune_key::legacy_header_matches(header, legacy_setup)) {
+            imported_legacy = true;
+            return true;
         }
         return false;
     };
@@ -4215,8 +4213,9 @@ bool tune_read_file(const std::string& path, const std::string& expected_header,
         return false;
     }
     if (imported_legacy) {
-        if (m.size() != legacy_devices.size()) return false;
-        for (const auto& d : legacy_devices) if (!m.count(d)) return false;
+        std::vector<std::string> loaded_devices;
+        for (const auto& d : m) loaded_devices.push_back(d.first);
+        if (!gemm_tune_key::legacy_devices_match(legacy_devices, loaded_devices)) return false;
     }
     out = std::move(m);
     return true;
@@ -4225,6 +4224,7 @@ bool tune_read(const TuneStore& s, std::map<std::string, TuneMap>& out, bool ver
     return tune_read_file(s.path, s.header, false, "", {}, out, verbose);
 }
 bool tune_read_legacy(const TuneStore& s, std::map<std::string, TuneMap>& out, bool verbose) {
+    if (strcmp(QE_GEMM_KERNEL_SET_HASH, QE_GEMM_V1_LEGACY_KERNEL_SET_HASH) != 0) return false;
     return tune_read_file(s.legacy_path, s.header, true, s.legacy_setup, s.legacy_devices, out, verbose);
 }
 void tune_save(TuneStore& s);  // called under s.mu
