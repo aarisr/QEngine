@@ -1853,29 +1853,31 @@ __device__ __forceinline__ void attn_dec8d_dev(
         qpos = p0 + mi - (tree && mi >= 5 ? 4 : 0);
     };
     const int d0 = warp * 64;  // this warp's dims
-    // Q fragments for its 64 dims (4 chunks of 16), dims permuted like attn_dec8
-    uint32_t qf[MT][4][4];
-    int qpos[MT][2];
+    // Q rows; the fragments (4 chunks of 16 dims of this warp, dims permuted like attn_dec8) are reloaded per tile
+    int qoff[MT][2];
+    int qpos[2];  // of the row tile this warp owns (warp mt: the softmax of row tile mt)
+    {
+        int qa, qb2;
+        row_q((rt0 + warp) * 16 + g, qa, qpos[0]);
+        row_q((rt0 + warp) * 16 + g + 8, qb2, qpos[1]);
+    }
 #pragma unroll
     for (int mt = 0; mt < MT; mt++) {
-        int qa, qb2;
-        row_q((rt0 + mt) * 16 + g, qa, qpos[mt][0]);
-        row_q((rt0 + mt) * 16 + g + 8, qb2, qpos[mt][1]);
-        const bf16* ra = q + (size_t)qa * D;
-        const bf16* rb = q + (size_t)qb2 * D;
-#pragma unroll
-        for (int kk = 0; kk < 4; kk++) {
-            const int d = d0 + kk * 16 + 4 * t;
-            auto cv = [](const bf16* p) {
-                const float2 f = __bfloat1622float2(*reinterpret_cast<const bf162*>(p));
-                return pack_f16(f.x, f.y);
-            };
-            qf[mt][kk][0] = cv(ra + d);
-            qf[mt][kk][1] = cv(rb + d);
-            qf[mt][kk][2] = cv(ra + d + 2);
-            qf[mt][kk][3] = cv(rb + d + 2);
-        }
+        int qa, qb2, qp;
+        row_q((rt0 + mt) * 16 + g, qa, qp);
+        row_q((rt0 + mt) * 16 + g + 8, qb2, qp);
+        qoff[mt][0] = qa * D + d0 + 4 * t;
+        qoff[mt][1] = qb2 * D + d0 + 4 * t;
     }
+    auto qfrag = [&](int mt, int kk, uint32_t (&f)[4]) {
+        auto cv = [](const bf16* p) {
+            const float2 f2 = __bfloat1622float2(*reinterpret_cast<const bf162*>(p));
+            return pack_f16(f2.x, f2.y);
+        };
+        const bf16* ra = q + qoff[mt][0] + kk * 16;
+        const bf16* rb = q + qoff[mt][1] + kk * 16;
+        f[0] = cv(ra); f[1] = cv(rb); f[2] = cv(ra + 2); f[3] = cv(rb + 2);
+    };
     const int ntiles = (kend - kbeg + kD8Tile - 1) / kD8Tile;
     const uint8_t* kcb = kc + head_rows(s, kv, v.max_t) * RB;
     const uint8_t* vcb = vc + head_rows(s, kv, v.max_t) * RB;
@@ -1915,9 +1917,8 @@ __device__ __forceinline__ void attn_dec8d_dev(
     for (int mt = 0; mt < MT; mt++)
 #pragma unroll
         for (int j = 0; j < 8; j++) o[mt][j][0] = o[mt][j][1] = o[mt][j][2] = o[mt][j][3] = 0.f;
-    float mx[MT][2], l[MT][2];
-#pragma unroll
-    for (int mt = 0; mt < MT; mt++) mx[mt][0] = mx[mt][1] = -FLT_MAX, l[mt][0] = l[mt][1] = 0.f;
+    float mx[2], l[2];  // of the row tile this warp owns
+    mx[0] = mx[1] = -FLT_MAX, l[0] = l[1] = 0.f;
     // K4 (review M1): P x V-scale is rounded to fp16 before the PV MMA; a power of two vf lifts it out of the fp16
     // subnormals (P ~1e-6 at long context times scales ~1e-2), sized from the layer's V range (vs x 448) so the operand
     // vf x scale stays <= 16384 / 7.5; divided out with vscale. The K4 PV MMA accumulates in fp32 (re-review N1: a flat
@@ -1965,7 +1966,11 @@ __device__ __forceinline__ void attn_dec8d_dev(
                     b1 = e4m3x2_to_f16x2(__byte_perm(w, 0, 0x4342));
                 }
 #pragma unroll
-                for (int mt = 0; mt < MT; mt++) mma_hacc(sh[mt][j], qf[mt][kk], b0, b1);
+                for (int mt = 0; mt < MT; mt++) {
+                    uint32_t qf[4];
+                    qfrag(mt, kk, qf);
+                    mma_hacc(sh[mt][j], qf, b0, b1);
+                }
             }
         }
         // exchange partial scores (fp16 MMA results): sx[warp][mt][j][lane]
@@ -2000,7 +2005,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     const int key = kt0 + j * 8 + 2 * t + (e & 1);
-                    const int qp = (e < 2) ? qpos[mt][0] : qpos[mt][1];
+                    const int qp = (e < 2) ? qpos[0] : qpos[1];
                     float v = sc[mt][j][e] * scale;
                     if (key >= kend || (tail && pm_unrank(pm, key) > qp)) v = -FLT_MAX;
                     sc[mt][j][e] = v;
@@ -2011,9 +2016,9 @@ __device__ __forceinline__ void attn_dec8d_dev(
             for (int r = 0; r < 2; r++) {
                 tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffffu, tmax[r], 1));
                 tmax[r] = fmaxf(tmax[r], __shfl_xor_sync(0xffffffffu, tmax[r], 2));
-                const float nm = fmaxf(mx[mt][r], tmax[r]);
-                al[r] = (mx[mt][r] == -FLT_MAX) ? 0.f : exp2f(mx[mt][r] - nm);
-                mx[mt][r] = nm;
+                const float nm = fmaxf(mx[r], tmax[r]);
+                al[r] = (mx[r] == -FLT_MAX) ? 0.f : exp2f(mx[r] - nm);
+                mx[r] = nm;
             }
             float rs[2] = {0.f, 0.f};
 #pragma unroll
@@ -2021,7 +2026,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     const float v = sc[mt][j][e];
-                    const float pv = (v == -FLT_MAX) ? 0.f : exp2f(v - mx[mt][e >> 1]);
+                    const float pv = (v == -FLT_MAX) ? 0.f : exp2f(v - mx[e >> 1]);
                     sc[mt][j][e] = pv;
                     rs[e >> 1] += pv;
                 }
@@ -2029,7 +2034,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
             for (int r = 0; r < 2; r++) {
                 rs[r] += __shfl_xor_sync(0xffffffffu, rs[r], 1);
                 rs[r] += __shfl_xor_sync(0xffffffffu, rs[r], 2);
-                l[mt][r] = l[mt][r] * al[r] + rs[r];
+                l[r] = l[r] * al[r] + rs[r];
             }
             uint32_t* dst = spa + ((size_t)mt * 32 + lane) * PW;
 #pragma unroll
@@ -2040,47 +2045,50 @@ __device__ __forceinline__ void attn_dec8d_dev(
             *reinterpret_cast<float2*>(dst + kD8J * 2) = make_float2(al[0], al[1]);
         }
         __syncthreads();
-        // A fragments of P per 16-key step: {j=2s (rows g, g+8), j=2s+1}
-        uint32_t pa[MT][kD8Tile / 16][4];
+        // A fragments of P per 16-key step: {j=2s (rows g, g+8), j=2s+1}. K4 does not keep them: its P x V-scale
+        // fragments are built from shared memory one 32-dim group at a time, below (register pressure, patch 0035)
+        uint32_t pa[K4 ? 1 : MT][kD8Tile / 16][4];
         float alpha[MT][2];
 #pragma unroll
         for (int mt = 0; mt < MT; mt++) {
             const uint32_t* src = spa + ((size_t)mt * 32 + lane) * PW;
+            if (!K4) {
 #pragma unroll
-            for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
-                const uint4 pk = *reinterpret_cast<const uint4*>(src + s16 * 4);
-                pa[mt][s16][0] = pk.x; pa[mt][s16][1] = pk.y; pa[mt][s16][2] = pk.z; pa[mt][s16][3] = pk.w;
+                for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
+                    const uint4 pk = *reinterpret_cast<const uint4*>(src + s16 * 4);
+                    pa[mt][s16][0] = pk.x; pa[mt][s16][1] = pk.y; pa[mt][s16][2] = pk.z; pa[mt][s16][3] = pk.w;
+                }
             }
             const float2 al = *reinterpret_cast<const float2*>(src + kD8J * 2);
             alpha[mt][0] = al.x; alpha[mt][1] = al.y;
         }
-        // K4: P x (V scale of the key, per 32-dim group of this warp's dims): pq[grp][mt][s16][4]
-        uint32_t pq[K4 ? 2 : 1][MT][kD8Tile / 16][4];
-        if (K4) {
-#pragma unroll
-            for (int gq = 0; gq < 2; gq++)
-#pragma unroll
-                for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
-                    const int k0 = s16 * 16 + 2 * t, grp = warp * 2 + gq;
-                    auto vsc = [&](int key) { return reinterpret_cast<const __half*>(vs + key * kKv4Row + 128)[grp]; };
-                    // (in fp32, saturating before the fp16 rounding: re-review N4)
-                    auto sv = [&](int key) { return __float2half_rn(fminf(__half2float(vsc(key)) * vf, 65504.f)); };
-                    const __half2 sa = __halves2half2(sv(k0), sv(k0 + 1)), sb = __halves2half2(sv(k0 + 8), sv(k0 + 9));
-#pragma unroll
-                    for (int mt = 0; mt < MT; mt++) {
-                        pq[gq][mt][s16][0] = hmul2u(pa[mt][s16][0], sa);
-                        pq[gq][mt][s16][1] = hmul2u(pa[mt][s16][1], sa);
-                        pq[gq][mt][s16][2] = hmul2u(pa[mt][s16][2], sb);
-                        pq[gq][mt][s16][3] = hmul2u(pa[mt][s16][3], sb);
-                    }
-                }
-        }
+        // K4: P x (V scale of the key, per 32-dim group of this warp's dims): pq[mt][s16][4] of the current group
+        uint32_t pq[K4 ? MT : 1][kD8Tile / 16][4];
         // O += P V over this warp's 64 dims (8 n8 tiles); each V fragment serves all row tiles
 #pragma unroll
         for (int nd = 0; nd < 8; nd++) {
             const int d = d0 + nd * 8 + g, c = d >> 4, cb = d & 15;
             uint32_t bv[kD8Tile / 16][2];
             if (K4) {
+                if ((nd & 3) == 0) {  // group gq = nd >> 2: its 4 n8 tiles share one set of scaled P fragments
+                    const int gq = nd >> 2;
+#pragma unroll
+                    for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
+                        const int k0 = s16 * 16 + 2 * t, grp = warp * 2 + gq;
+                        auto vsc = [&](int key) { return reinterpret_cast<const __half*>(vs + key * kKv4Row + 128)[grp]; };
+                        // (in fp32, saturating before the fp16 rounding: re-review N4)
+                        auto sv = [&](int key) { return __float2half_rn(fminf(__half2float(vsc(key)) * vf, 65504.f)); };
+                        const __half2 sa = __halves2half2(sv(k0), sv(k0 + 1)), sb = __halves2half2(sv(k0 + 8), sv(k0 + 9));
+#pragma unroll
+                        for (int mt = 0; mt < MT; mt++) {
+                            const uint4 pk = *reinterpret_cast<const uint4*>(spa + ((size_t)mt * 32 + lane) * PW + s16 * 4);
+                            pq[mt][s16][0] = hmul2u(pk.x, sa);
+                            pq[mt][s16][1] = hmul2u(pk.y, sa);
+                            pq[mt][s16][2] = hmul2u(pk.z, sb);
+                            pq[mt][s16][3] = hmul2u(pk.w, sb);
+                        }
+                    }
+                }
                 const int bo = d >> 1, sh = (d & 1) * 4;
 #pragma unroll
                 for (int s16 = 0; s16 < kD8Tile / 16; s16++) {
@@ -2093,7 +2101,7 @@ __device__ __forceinline__ void attn_dec8d_dev(
                 for (int mt = 0; mt < MT; mt++) {
                     float c4[4] = {0.f, 0.f, 0.f, 0.f};  // (fp32 accumulate: N1)
 #pragma unroll
-                    for (int s16 = 0; s16 < kD8Tile / 16; s16++) mma_f16(c4, pq[K4 ? nd >> 2 : 0][mt][s16], bv[s16][0], bv[s16][1]);
+                    for (int s16 = 0; s16 < kD8Tile / 16; s16++) mma_f16(c4, pq[mt][s16], bv[s16][0], bv[s16][1]);
                     o[mt][nd][0] = o[mt][nd][0] * alpha[mt][0] + c4[0];
                     o[mt][nd][1] = o[mt][nd][1] * alpha[mt][0] + c4[1];
                     o[mt][nd][2] = o[mt][nd][2] * alpha[mt][1] + c4[2];
@@ -2140,8 +2148,8 @@ __device__ __forceinline__ void attn_dec8d_dev(
                     make_float2(o[mt][nd][r * 2] * vscale, o[mt][nd][r * 2 + 1] * vscale);
             }
             if (warp == mt && t == 0) {  // the row tile's softmax owner
-                wml[row * 2] = mx[mt][r] == -FLT_MAX ? -FLT_MAX : mx[mt][r] * 0.6931471805599453f;
-                wml[row * 2 + 1] = l[mt][r];
+                wml[row * 2] = mx[r] == -FLT_MAX ? -FLT_MAX : mx[r] * 0.6931471805599453f;
+                wml[row * 2 + 1] = l[r];
             }
         }
 }

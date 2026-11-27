@@ -125,12 +125,22 @@ __global__ void fill_bf16_kernel(bf16* p, size_t n, uint32_t seed) {
     }
 }
 }  // namespace
-extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) {
+namespace {
+// 4-bit rows: the 8 fp16 group scales (bytes 128..143) get finite values, the nibbles stay pseudo-random
+__global__ void kv4_scales_kernel(uint8_t* p, size_t rows, uint32_t seed) {
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < rows; i += (size_t)gridDim.x * blockDim.x) {
+        uint32_t x = (uint32_t)i * 2654435761u ^ seed;
+        x ^= x >> 13; x *= 0x5bd1e995u; x ^= x >> 15;
+        __half* sc = reinterpret_cast<__half*>(p + i * kKv4Row + 128);
+        for (int k = 0; k < 8; k++) sc[k] = __float2half(((int)((x >> (k * 3)) % 24) + 8) * (1.f / 1024.f));
+    }
+}
+unsigned long long check_attn_seg(int nseg, int ctx, int m, bool kv4) {
     AttnShape s{};
     s.nq = 8; s.nkv = 2;
     s.kv_qb[0] = 0; s.kv_qe[0] = 6; s.kv_qb[1] = 6; s.kv_qe[1] = 8;
     for (int h = 0; h < 8; h++) s.q2kv[h] = h < 6 ? 0 : 1;
-    s.max_t = ctx + 64; s.fp8 = 1; s.ks = 0.02f; s.vs = 0.02f; s.dchunk_min = -1;
+    s.max_t = ctx + 64; s.fp8 = 1; s.ks = 0.02f; s.vs = 0.02f; s.dchunk_min = -1; s.kv4 = kv4;
     const int ld = 8 * 512 + 2 * 512;
     const size_t kvb = (size_t)2 * s.max_t * 256;
     const size_t wf = attn_work_floats(s);
@@ -149,6 +159,10 @@ extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) {
         c.kc = al(kvb, 0); c.vc = al(kvb, 0);
         fill_rand_kernel<<<256, 256>>>((uint8_t*)c.kc, kvb, 1234u + i, 0x77);  // finite e4m3 (no NaN pattern)
         fill_rand_kernel<<<256, 256>>>((uint8_t*)c.vc, kvb, 4321u + i, 0x77);
+        if (kv4) {
+            kv4_scales_kernel<<<256, 256>>>((uint8_t*)c.kc, (size_t)2 * s.max_t, 99u + i);
+            kv4_scales_kernel<<<256, 256>>>((uint8_t*)c.vc, (size_t)2 * s.max_t, 55u + i);
+        }
         const int p0 = ctx - m;
         int* pos = (int*)al(4, 0);
         CUDA_CHECK(cudaMemcpy(pos, &p0, 4, cudaMemcpyHostToDevice));
@@ -184,3 +198,7 @@ extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) {
     for (void* p : bufs) cudaFree(p);
     return h;
 }
+}  // namespace
+extern "C" unsigned long long qe_check_attn_seg(int nseg, int ctx, int m) { return check_attn_seg(nseg, ctx, m, false); }
+// the same for the 4-bit cache (attn_dec8d_seg_kernel<MT, true>)
+extern "C" unsigned long long qe_check_attn_seg_kv4(int nseg, int ctx, int m) { return check_attn_seg(nseg, ctx, m, true); }
