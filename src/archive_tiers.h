@@ -13,6 +13,7 @@
 #include <ctime>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -237,5 +238,32 @@ private:
     std::map<std::string, Obj> objs_;
     uint64_t seq_ = 0;
 };
+
+// [al0-0039] Sibling rescan decision: the pure part. `known`: every archive file name this arm indexes (own tiers and
+// siblings) plus the names it already rejected unchanged; `indexed_here`: the sibling names indexed from this directory;
+// `listing`: the directory's current names. Only ".qkv" names are candidates (a ".tmp" is a file still being written).
+// `add`: new names to verify and index; `forget`: indexed sibling names that vanished (the other arm evicted them).
+// Nothing here deletes: a sibling file is never ours to unlink, so there is no "remove" output at all.
+struct SiblingDelta {
+    std::vector<std::string> add, forget;
+};
+inline SiblingDelta sibling_rescan_delta(const std::set<std::string>& known, const std::set<std::string>& indexed_here,
+                                         const std::vector<std::string>& listing) {
+    SiblingDelta d;
+    std::set<std::string> present;
+    for (const auto& nm : listing) {
+        if (nm.size() < 5 || nm.compare(nm.size() - 4, 4, ".qkv") != 0) continue;
+        present.insert(nm);
+        if (!known.count(nm)) d.add.push_back(nm);
+    }
+    for (const auto& nm : indexed_here)
+        if (!present.count(nm)) d.forget.push_back(nm);
+    return d;
+}
+// The rescan runs when enabled (every_s > 0), the engine is idle (no request admitted or prefilling) and a full
+// interval passed since the last one.
+inline bool sibling_rescan_due(long long every_s, bool idle, long long now_s, long long last_s) {
+    return every_s > 0 && idle && now_s - last_s >= every_s;
+}
 
 }  // namespace qe_archive_store

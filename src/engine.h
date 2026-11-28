@@ -197,6 +197,13 @@ public:
     size_t delete_session(unsigned long long session);
     // Drop archives whose TTL ran out; returns the archives dropped.
     int archive_gc();
+    // [al0-0039] Re-list the sibling (read-only) store directories: index new files, forget vanished ones; never writes
+    // or unlinks there. Idle-gated, QE_SIBLING_RESCAN_S (60; 0 = off). Returns the archives added.
+    int rescan_sibling_dirs();
+    void sibling_stats(long long* indexed, long long* rescans) const {
+        *indexed = (long long)sibling_indexed_.load(std::memory_order_relaxed);
+        *rescans = (long long)sibling_rescans_.load(std::memory_order_relaxed);
+    }
     int num_tiers() const { return store_.tiers(); }
     // out[0..4) = bytes, objects, evictions, cap of tier i; false when i is out of range
     bool tier_info(int i, double* out) const;
@@ -781,6 +788,13 @@ private:
     unsigned long long cur_session_ = 0;
     long long cur_ttl_s_ = 0;
     long long last_gc_s_ = 0;
+    // [al0-0039] sibling rescan: the read-only directories, the last run, files rejected unchanged, the metrics
+    std::vector<std::string> sibling_dirs_;
+    long long last_rescan_s_ = 0;
+    std::map<std::string, std::pair<long long, long long>> sibling_rejected_;  // name -> (mtime, size)
+    std::atomic<size_t> sibling_indexed_{0}, sibling_rescans_{0};
+    // verify one archive file the way start-up does: 1 indexed into `a`, 0 not a usable archive, -1 not openable
+    int read_archive_file(const std::string& path, bool read_only, int tier, time_t now, KvArchive& a, time_t* mtime);
     size_t disk_budget_ = 0;  // the largest tier cap: a file bigger than it is never planned
     std::atomic<size_t> disk_restore_hits_{0};
     std::atomic<size_t> disk_restore_tokens_{0};

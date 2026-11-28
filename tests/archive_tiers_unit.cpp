@@ -150,6 +150,30 @@ static void test_delete_session_remove_path() {
     rm_dir(d);
 }
 
+// [al0-0039] the sibling rescan decision: only new names are added, vanished ones forgotten, nothing is deleted
+static void test_sibling_rescan_delta() {
+    using namespace qe_archive_store;
+    const std::set<std::string> known{"a.qkv", "b.qkv", "own.qkv", "bad.qkv"}, here{"a.qkv", "b.qkv"};
+    // a new file appears, b vanished, a is still there; a .tmp (in flight) and a foreign name are no candidates
+    auto d = sibling_rescan_delta(known, here, {"a.qkv", "new.qkv", "w.qkv.tmp", "notes.txt", "own.qkv", "bad.qkv"});
+    EXPECT(d.add == std::vector<std::string>{"new.qkv"});  // indexed, own and rejected names are never re-added
+    EXPECT(d.forget == std::vector<std::string>{"b.qkv"});  // vanished
+    // an unchanged listing: nothing to do
+    d = sibling_rescan_delta(known, here, {"a.qkv", "b.qkv"});
+    EXPECT(d.add.empty() && d.forget.empty());
+    // everything vanished: all indexed siblings forgotten, none re-added (there is no delete output at all)
+    d = sibling_rescan_delta(known, here, {});
+    EXPECT(d.add.empty() && d.forget.size() == 2);
+    // an own file with the same name never becomes a sibling entry, and never shows up as forgettable
+    d = sibling_rescan_delta(known, here, {"a.qkv", "b.qkv", "own.qkv"});
+    EXPECT(d.add.empty() && d.forget.empty());
+    // the schedule: off, busy, too early and due
+    EXPECT(!sibling_rescan_due(0, true, 1000, 0));
+    EXPECT(!sibling_rescan_due(60, false, 1000, 0));
+    EXPECT(!sibling_rescan_due(60, true, 1000, 950));
+    EXPECT(sibling_rescan_due(60, true, 1000, 940));
+}
+
 int main() {
     const std::string ram = mkdtemp_dir("ram"), nvme = mkdtemp_dir("nvme");
     EXPECT(!ram.empty() && !nvme.empty());
@@ -267,6 +291,7 @@ int main() {
 
     // characterization: the methods the coverage file marks uncovered, one test function each
     test_read_only_sibling_never_targeted();
+    test_sibling_rescan_delta();
     test_reset_objects();
     test_get();
     test_evict_count();

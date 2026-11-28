@@ -92,6 +92,7 @@ SIGS = {
     "qe_pool_counters": (None, [c_void_p, P_i64]),
     "qe_restore_stats": (None, [c_void_p, P_i64, P_i64]),
     "qe_restore_stats_by_source": (None, [c_void_p, P_i64, P_i64, P_i64, P_i64]),
+    "qe_sibling_stats": (None, [c_void_p, P_i64, P_i64]),
     "qe_class_admission_allowed": (c_int, [c_void_p, c_int, c_int]),
     "qe_watch_stops": (None, [c_void_p, c_int, c_int]),
     "qe_set_no_ahead": (None, [c_void_p, c_int, c_int]),
@@ -774,6 +775,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
             restore_source = {"restore_hits_own": int(own_hits[0]), "restore_tokens_own": int(own_tokens[0]),
                               "restore_hits_sibling": int(sibling_hits[0]),
                               "restore_tokens_sibling": int(sibling_tokens[0])}
+        sib_indexed = (ctypes.c_longlong * 1)()
+        sib_rescans = (ctypes.c_longlong * 1)()
+        if "qe_sibling_stats" in self.fns:
+            L.qe_sibling_stats(h, sib_indexed, sib_rescans)
         cl = []
         if convs and "qe_conv_list" in self.fns:  # least recently used first: the next to leave VRAM / the archive
             m = 256
@@ -785,7 +790,9 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         archives = {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                     "pinned_bytes": a[4], "pinned_used": a[5], "disk_evictions": int(a[6]),
                     "tiers": self.tier_stats(), "restore_hits": int(restore_hits[0]),
-                    "restore_tokens": int(restore_tokens[0]), **restore_source}
+                    "restore_tokens": int(restore_tokens[0]), **restore_source,
+                    **({"sibling_indexed": int(sib_indexed[0]), "sibling_rescans": int(sib_rescans[0])}
+                       if "qe_sibling_stats" in self.fns else {})}
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots, "conversations": cl,
                 "archives": archives,
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},

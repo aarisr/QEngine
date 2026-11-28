@@ -285,6 +285,7 @@ void qe_restore_stats_by_source(void* e, long long* own_hits, long long* own_tok
                                 long long* sib_tokens) {
     ((Engine*)e)->restore_stats_by_source(own_hits, own_tokens, sib_hits, sib_tokens);
 }
+void qe_sibling_stats(void* e, long long* indexed, long long* rescans) { ((Engine*)e)->sibling_stats(indexed, rescans); }
 // [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
 int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
 int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }

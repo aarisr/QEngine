@@ -434,6 +434,11 @@ class Metrics:
                        "# TYPE qengine_archive_restore_tokens_total counter")
             out.append(f'qengine_archive_restore_tokens_total{{source="own"}} {arch["restore_tokens_own"]}')
             out.append(f'qengine_archive_restore_tokens_total{{source="sibling"}} {arch["restore_tokens_sibling"]}')
+        if "sibling_indexed" in arch:
+            m("archive_sibling_indexed", arch["sibling_indexed"],
+              "sibling arms' read-only archive files currently indexed (QE_DISK_CACHE_READ_DIRS)")
+            m("archive_sibling_rescans_total", arch["sibling_rescans"],
+              "idle rescans of the sibling store directories (engine lifetime)", "counter")
         tiers = arch.get("tiers") or []
         for name, key, help_, typ in (
                 ("archive_tier_bytes", "bytes", "bytes held by the persistent archive tier", "gauge"),

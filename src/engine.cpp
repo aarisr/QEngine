@@ -2437,6 +2437,10 @@ void Engine::mem_guard(bool vram) {
         static const double idle_every = env_int("QE_IDLE_POLL_S", 0);
         bool idle = pfs_.empty();
         for (const Seq& x : seqs_) idle = idle && !x.active;
+        static const long long rescan_every = env_int("QE_SIBLING_RESCAN_S", 60);  // [al0-0039] 0 = off
+        if (!sibling_dirs_.empty() &&
+            qe_archive_store::sibling_rescan_due(rescan_every, idle && !disk_dir_.empty(), (long long)time(nullptr), last_rescan_s_))
+            rescan_sibling_dirs();
         if (qe_idle_poll::due(idle, pool_tokens_ < pool_tokens0_, vnow_s(), &vidle_last_, idle_every)) vram_tick();
     }  // (also when idle: the server calls this every second; a shrunk pool grows back without requests, H1)
     mem_pressure();
@@ -3447,6 +3451,78 @@ bool Engine::archive_load(KvArchive& a) {
     return true;
 }
 
+// Verify one archive file exactly as start-up does (magic, fingerprint, sizes, header checksum). Opens read-only only.
+int Engine::read_archive_file(const std::string& path, bool read_only, int tier, time_t now, KvArchive& a, time_t* mtime) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    FILE* f = fd >= 0 ? fdopen(fd, "rb") : nullptr;
+    if (!f) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    bool ok = false;
+    do {
+        char mg[8];
+        uint32_t fl, ns, ngs;
+        int32_t n;
+        if (fread(mg, 1, 8, f) != 8) break;
+        const bool v4 = memcmp(mg, kArchMagicV4, 8) == 0;
+        const bool v3 = memcmp(mg, kArchMagic, 8) == 0;
+        if (!v4 && !v3 && memcmp(mg, kArchMagicV2, 8) != 0) break;
+        if (fread(&fl, 4, 1, f) != 1 || fl > 65536) break;
+        std::string fps(fl, '\0');
+        if (fread(&fps[0], 1, fl, f) != fl || fps != fingerprint_) break;
+        if (fread(&n, 4, 1, f) != 1 || n <= 0) break;
+        int64_t sess = 0, expires = 0;
+        if (v4 && (fread(&a.sk, 8, 1, f) != 1 || fread(&sess, 8, 1, f) != 1 || fread(&expires, 8, 1, f) != 1)) break;
+        a.session = (unsigned long long)sess, a.expires = expires;
+        if (expires > 0 && expires <= now) break;  // TTL ran out while stopped: dropped (own files unlinked below)
+        if (fread(&ns, 4, 1, f) != 1 || ns > kMaxSubs) break;
+        a.subs.resize(ns);
+        if (ns && fread(a.subs.data(), 4, ns, f) != ns) break;
+        if (fread(&ngs, 4, 1, f) != 1 || ngs != workers_.size()) break;
+        bool sz_ok = true;
+        for (uint32_t r = 0; r < ngs; r++) {
+            uint64_t sz;
+            if (fread(&sz, 8, 1, f) != 1) { sz_ok = false; break; }
+            sz_ok &= sz == workers_[r]->archive_bytes(0, n) + ns * workers_[r]->snapshot_bytes();
+            a.sizes.push_back(sz);
+            a.total += sz;
+        }
+        if (!sz_ok) break;
+        std::vector<uint64_t> hs;
+        uint64_t hh = 0;
+        if (v4 || v3) {
+            uint32_t nh;
+            if (fread(&nh, 4, 1, f) != 1 || nh != ngs * (1 + ns)) break;
+            hs.resize(nh);
+            if (fread(hs.data(), 8, nh, f) != nh) break;
+            if (fread(&hh, 8, 1, f) != 1) break;
+        }
+        a.toks.resize(n);
+        if (fread(a.toks.data(), 4, n, f) != (size_t)n) break;
+        if ((v4 && arch_hdr_hash_v4(n, a.sk, sess, expires, a.subs, a.toks.data()) != hh) ||
+            (v3 && arch_hdr_hash(n, a.subs, a.toks.data()) != hh)) {
+            fprintf(stderr, "RAM archive store: header checksum mismatch, skipped: %s\n", path.c_str());
+            break;
+        }
+        a.n = n;
+        a.data_off = ftell(f);
+        struct stat stt;
+        if (a.data_off < 0 || fstat(fileno(f), &stt) != 0 ||
+            (size_t)stt.st_size != (size_t)a.data_off + a.total) break;
+        a.path = path;
+        a.disk_readonly = read_only;
+        a.tier = tier;
+        a.disk = std::make_shared<DiskState>();
+        a.disk->done = a.disk->ok = true;
+        a.disk->hash = std::move(hs);
+        *mtime = stt.st_mtime;
+        ok = true;
+    } while (false);
+    fclose(f);
+    return ok ? 1 : 0;
+}
+
 // Disk cache setup: identity of the model / split (archives of another configuration are
 // ignored), index of the existing files (LRU order by modification time), writer thread.
 void Engine::disk_init() {
@@ -3532,7 +3608,7 @@ void Engine::disk_init() {
             const std::string path = paths.substr(at, end == std::string::npos ? end : end - at);
             bool own = false;
             for (int t = 0; t < store_.tiers(); t++) own = own || store_.tier(t).dir == path;
-            if (!path.empty() && !own) scan_dirs.push_back({path, true, 0});
+            if (!path.empty() && !own) scan_dirs.push_back({path, true, 0}), sibling_dirs_.push_back(path);
             if (end == std::string::npos) break;
             at = end + 1;
         }
@@ -3564,75 +3640,15 @@ void Engine::disk_init() {
                 if (!read_only) unlink(path.c_str());
                 continue;
             }
-            const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-            FILE* f = fd >= 0 ? fdopen(fd, "rb") : nullptr;
-            if (!f) {
-                if (fd >= 0) close(fd);
-                continue;
-            }
             KvArchive a;
-            bool ok = false;
-            do {
-                char mg[8];
-                uint32_t fl, ns, ngs;
-                int32_t n;
-                if (fread(mg, 1, 8, f) != 8) break;
-                const bool v4 = memcmp(mg, kArchMagicV4, 8) == 0;
-                const bool v3 = memcmp(mg, kArchMagic, 8) == 0;
-                if (!v4 && !v3 && memcmp(mg, kArchMagicV2, 8) != 0) break;
-                if (fread(&fl, 4, 1, f) != 1 || fl > 65536) break;
-                std::string fps(fl, '\0');
-                if (fread(&fps[0], 1, fl, f) != fl || fps != fingerprint_) break;
-                if (fread(&n, 4, 1, f) != 1 || n <= 0) break;
-                int64_t sess = 0, expires = 0;
-                if (v4 && (fread(&a.sk, 8, 1, f) != 1 || fread(&sess, 8, 1, f) != 1 || fread(&expires, 8, 1, f) != 1)) break;
-                a.session = (unsigned long long)sess, a.expires = expires;
-                if (expires > 0 && expires <= now) break;  // TTL ran out while stopped: dropped (own files unlinked below)
-                if (fread(&ns, 4, 1, f) != 1 || ns > kMaxSubs) break;
-                a.subs.resize(ns);
-                if (ns && fread(a.subs.data(), 4, ns, f) != ns) break;
-                if (fread(&ngs, 4, 1, f) != 1 || ngs != workers_.size()) break;
-                bool sz_ok = true;
-                for (uint32_t r = 0; r < ngs; r++) {
-                    uint64_t sz;
-                    if (fread(&sz, 8, 1, f) != 1) { sz_ok = false; break; }
-                    sz_ok &= sz == workers_[r]->archive_bytes(0, n) + ns * workers_[r]->snapshot_bytes();
-                    a.sizes.push_back(sz);
-                    a.total += sz;
-                }
-                if (!sz_ok) break;
-                std::vector<uint64_t> hs;
-                uint64_t hh = 0;
-                if (v4 || v3) {
-                    uint32_t nh;
-                    if (fread(&nh, 4, 1, f) != 1 || nh != ngs * (1 + ns)) break;
-                    hs.resize(nh);
-                    if (fread(hs.data(), 8, nh, f) != nh) break;
-                    if (fread(&hh, 8, 1, f) != 1) break;
-                }
-                a.toks.resize(n);
-                if (fread(a.toks.data(), 4, n, f) != (size_t)n) break;
-                if ((v4 && arch_hdr_hash_v4(n, a.sk, sess, expires, a.subs, a.toks.data()) != hh) ||
-                    (v3 && arch_hdr_hash(n, a.subs, a.toks.data()) != hh)) {
-                    fprintf(stderr, "RAM archive store: header checksum mismatch, skipped: %s\n", path.c_str());
-                    break;
-                }
-                a.n = n;
-                a.data_off = ftell(f);
-                struct stat stt;
-                if (a.data_off < 0 || fstat(fileno(f), &stt) != 0 ||
-                    (size_t)stt.st_size != (size_t)a.data_off + a.total) break;
-                a.path = path;
-                a.disk_readonly = read_only;
-                a.tier = scan_tier;
-                a.disk = std::make_shared<DiskState>();
-                a.disk->done = a.disk->ok = true;
-                a.disk->hash = std::move(hs);
-                found.push_back({std::move(a), stt.st_mtime, read_only});
+            time_t mt = 0;
+            const int rc = read_archive_file(path, read_only, scan_tier, now, a, &mt);
+            if (rc < 0) continue;
+            const bool ok = rc > 0;
+            if (ok) {
+                found.push_back({std::move(a), mt, read_only});
                 seen_files.insert(nm);
-                ok = true;
-            } while (false);
-            fclose(f);
+            }
             if (!ok && !read_only) unlink(path.c_str());  // fingerprint mismatch, malformed header or orphaned format
         }
         closedir(dir);
@@ -3652,6 +3668,8 @@ void Engine::disk_init() {
         }
         archives_.push_back(std::move(fa.a));
     }
+    sibling_indexed_.store(peer_archives, std::memory_order_relaxed);
+    last_rescan_s_ = (long long)now;
     for (int t = 0; t < store_.tiers(); t++) disk_make_room(t, 0);
     for (int t = 0; t < store_.tiers(); t++) {
         const auto& tr = store_.tier(t);
@@ -3660,6 +3678,84 @@ void Engine::disk_init() {
                peer_archives, peer_bytes / (double)gib);
     }
     disk_thread_ = std::thread([this] { disk_writer(); });
+}
+
+// [al0-0039] Re-list the sibling arms' store directories while idle. Read-only by construction: it opens files for
+// reading (read_archive_file), forgets index entries (disk_forget never touches a read-only file) and never calls
+// unlink, rename, utimensat or an open for writing. Sibling bytes are not counted against any tier of this arm.
+int Engine::rescan_sibling_dirs() {
+    const time_t now = time(nullptr);
+    last_rescan_s_ = (long long)now;
+    const int64_t max_age = std::max(1, env_int("QE_CACHE_MAX_AGE_S", 7 * 24 * 60 * 60));
+    auto base = [](const std::string& p) { return p.substr(p.rfind('/') + 1); };
+    int added = 0;
+    for (const std::string& dir_path : sibling_dirs_) {
+        DIR* dir = opendir(dir_path.c_str());
+        if (!dir) continue;  // unavailable now: forget nothing (it may only be unmounted for a moment)
+        std::vector<std::string> listing;
+        while (dirent* e = readdir(dir)) listing.push_back(e->d_name);
+        closedir(dir);
+        const std::set<std::string> present(listing.begin(), listing.end());
+        std::set<std::string> known, indexed_here;
+        for (const auto& a : archives_) {
+            if (a.path.empty()) continue;
+            known.insert(base(a.path));
+            if (a.disk_readonly && a.path.compare(0, dir_path.size() + 1, dir_path + "/") == 0) indexed_here.insert(base(a.path));
+        }
+        for (auto it = sibling_rejected_.begin(); it != sibling_rejected_.end();) {  // rejected, unchanged: not read again
+            if (it->first.compare(0, dir_path.size() + 1, dir_path + "/") != 0) { ++it; continue; }
+            struct stat st{};
+            if (!present.count(base(it->first)) || lstat(it->first.c_str(), &st) != 0 ||
+                std::make_pair((long long)st.st_mtime, (long long)st.st_size) != it->second) {
+                it = sibling_rejected_.erase(it);
+                continue;
+            }
+            known.insert(base(it->first));
+            ++it;
+        }
+        const auto delta = qe_archive_store::sibling_rescan_delta(known, indexed_here, listing);
+        for (const std::string& nm : delta.add) {
+            const std::string path = dir_path + "/" + nm;
+            struct stat st{};
+            if (lstat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+            const std::pair<long long, long long> sig{(long long)st.st_mtime, (long long)st.st_size};
+            if (now > st.st_mtime && now - st.st_mtime > max_age) {
+                sibling_rejected_[path] = sig;
+                continue;
+            }
+            KvArchive a;
+            time_t mt = 0;
+            const int rc = read_archive_file(path, true, 0, now, a, &mt);
+            if (rc < 0) continue;
+            if (rc == 0) {
+                sibling_rejected_[path] = sig;
+                continue;
+            }
+            a.used = ++tick_;
+            archives_.push_back(std::move(a));
+            added++;
+        }
+        for (const std::string& nm : delta.forget) {
+            const std::string path = dir_path + "/" + nm;
+            for (auto it = archives_.begin(); it != archives_.end(); ++it) {
+                if (!it->disk_readonly || it->path != path) continue;
+                if (it->pinned || it->hold > 0) break;  // in use: the next rescan retries
+                if (it->ram) {  // already restored into memory: that copy stays, as an ordinary RAM archive
+                    disk_forget(*it);
+                    it->disk_readonly = false;
+                } else {
+                    drop_archive(it);
+                }
+                break;
+            }
+        }
+    }
+    size_t n = 0;
+    for (const auto& a : archives_) n += a.disk_readonly && !a.path.empty();
+    sibling_indexed_.store(n, std::memory_order_relaxed);
+    sibling_rescans_.fetch_add(1, std::memory_order_relaxed);
+    if (added) printf("archive store: sibling rescan indexed %d new archive(s), %zu sibling archives now\n", added, n), fflush(stdout);
+    return added;
 }
 
 // Persist the hottest archived checkpoints first, respecting the per-flush byte budget. Per session only the latest
