@@ -22,6 +22,8 @@ COUNTERS = ("requests", "errors", "prompt_tokens", "cached_tokens", "prefill_tok
             "reply_end_snapshots", "reply_end_snapshot_s")
 
 
+QWAIT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 300)  # [al0-0042] queue wait histogram bounds (s)
+
 class Metrics:
     def __init__(self, path, served_name=""):
         self.lock = threading.Lock()
@@ -52,6 +54,8 @@ class Metrics:
         self.hist = collections.deque(maxlen=600)  # 1 s buckets, last 10 min
         self.cur = self._bucket(int(self.t0))
         self.jobs = {}  # id -> live info (queued / prefill / decode)
+        # [al0-0042] queue wait (enqueue -> prefill start) per class: a Prometheus histogram
+        self.qwait = {c: [0] * (len(QWAIT_BUCKETS) + 1) + [0.0] for c in ("interactive", "background")}
         self.last_done = collections.deque(maxlen=12)
         self.ended = collections.deque()  # (t, frozen job view) of requests finished in the last 10 s
         self.engine = {}
@@ -90,6 +94,15 @@ class Metrics:
             j = self.jobs.get(id(job))
             if j:
                 j["state"], j["t_p"] = "prefill", time.time()
+                self._observe_qwait(j.get("class", "interactive"), j["t_p"] - j.get("t_q", j["t_p"]))
+
+    def _observe_qwait(self, cls, wait):
+        """[al0-0042] One queue wait (s) into the class histogram: cumulative buckets are made in prometheus()."""
+        h = self.qwait.setdefault(cls, [0] * (len(QWAIT_BUCKETS) + 1) + [0.0])
+        wait = max(0.0, wait)
+        i = next((k for k, le in enumerate(QWAIT_BUCKETS) if wait <= le), len(QWAIT_BUCKETS))
+        h[i] += 1
+        h[-1] += wait
 
     def prefill_done(self, job):
         now = time.time()
@@ -371,6 +384,23 @@ class Metrics:
         except Exception as ex:
             print(f"metrics: cannot save {self.path}: {ex}", flush=True)
 
+    def qwait_prometheus(self):
+        """[al0-0042] qengine_queue_wait_seconds{class}: time from enqueue to prefill start."""
+        lines = ["# HELP qengine_queue_wait_seconds time a request waited in the queue before its prefill started",
+                 "# TYPE qengine_queue_wait_seconds histogram"]
+        with self.lock:
+            items = {c: list(h) for c, h in self.qwait.items()}
+        for c, h in sorted(items.items()):
+            acc = 0
+            for le, n in zip(QWAIT_BUCKETS, h):
+                acc += n
+                lines.append(f'qengine_queue_wait_seconds_bucket{{class="{c}",le="{le:g}"}} {acc}')
+            acc += h[len(QWAIT_BUCKETS)]
+            lines.append(f'qengine_queue_wait_seconds_bucket{{class="{c}",le="+Inf"}} {acc}')
+            lines.append(f'qengine_queue_wait_seconds_sum{{class="{c}"}} {round(h[-1], 6)}')
+            lines.append(f'qengine_queue_wait_seconds_count{{class="{c}"}} {acc}')
+        return "\n".join(lines)
+
     def prometheus(self):
         s = self.snapshot()
         se, en = s["session"], s["engine"] or {}
@@ -396,6 +426,7 @@ class Metrics:
         m("spec_verify_steps_total", se["spec_steps"], "speculative verify steps (accepted + steps = tokens emitted)", "counter")
         m("spec_drafted_tokens_total", se["spec_drafted"], "draft tokens verified (MTP and lookup)", "counter")
         m("spec_accepted_tokens_total", se["spec_accepted"], "draft tokens the model accepted (MTP and lookup)", "counter")
+        out.append(self.qwait_prometheus())
         out.append("# HELP qengine_prompt_cache_requests_total requests by where their cached prompt prefix came from\n"
                    "# TYPE qengine_prompt_cache_requests_total counter")
         cs = se["cache_src"]
