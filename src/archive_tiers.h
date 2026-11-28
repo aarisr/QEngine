@@ -72,6 +72,10 @@ inline bool superseded_in_session(const std::vector<View>& v, size_t i) {
     return false;
 }
 // the session's older checkpoints once v[keep] is complete
+// [al0-0038] A file this arm may delete after it failed to read it back (checksum mismatch): only its own. A sibling
+// arm's file (QE_DISK_CACHE_READ_DIRS, read-only) is dropped from this arm's index but never unlinked: the other arm
+// owns it, and a bad read here may be a torn mapping, not a bad file.
+inline bool may_unlink_unreadable(bool read_only) { return !read_only; }
 inline std::vector<size_t> older_in_session(const std::vector<View>& v, size_t keep) {
     std::vector<size_t> r;
     if (v[keep].session)

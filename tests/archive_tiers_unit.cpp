@@ -45,6 +45,27 @@ static void rm_dir(const std::string& d) {
 }
 
 // characterization: reset_objects forgets the objects, the files stay, the tier and the eviction counters are kept
+// [al0-0038] A sibling arm's archive (QE_DISK_CACHE_READ_DIRS) is a protected view: no selection rule ever names it,
+// and a failed read-back never unlinks it. Mirrors Engine::archive_views (protect = pinned || hold || disk_readonly).
+static void test_read_only_sibling_never_targeted() {
+    using namespace qe_archive_store;
+    const uint64_t s = 0x5e55;
+    // index 0: our older checkpoint; 1: a sibling arm's file of the same session, expired and newest; 2: our newest
+    std::vector<View> v = {{s, 100, 1, false}, {s, 100, 9, true}, {s, 0, 5, false}};
+    const int64_t now = 1000;  // every expiry above is in the past
+    for (size_t i : delete_targets(v, s)) EXPECT(i != 1);
+    EXPECT(delete_targets(v, s) == (std::vector<size_t>{0, 2}));
+    for (size_t i : expired_targets(v, now)) EXPECT(i != 1);
+    EXPECT(expired_targets(v, now) == std::vector<size_t>{0});
+    for (size_t i : older_in_session(v, 2)) EXPECT(i != 1);  // keep our newest: the sibling is not "older" prey
+    EXPECT(older_in_session(v, 2) == std::vector<size_t>{0});
+    // a protected newer sibling never makes our own checkpoint "superseded" (it would skip our flush)
+    EXPECT(!superseded_in_session(std::vector<View>{{s, 0, 5, false}, {s, 0, 9, true}}, 0));
+    // a failed read-back: our own file may go, a read-only sibling file never
+    EXPECT(may_unlink_unreadable(false));
+    EXPECT(!may_unlink_unreadable(true));
+}
+
 static void test_reset_objects() {
     TieredStore s;
     const int64_t now = 1000000;
@@ -245,6 +266,7 @@ int main() {
     }
 
     // characterization: the methods the coverage file marks uncovered, one test function each
+    test_read_only_sibling_never_targeted();
     test_reset_objects();
     test_get();
     test_evict_count();

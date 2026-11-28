@@ -2727,7 +2727,7 @@ std::vector<Engine::ArchSub> Engine::archive_subs(const Seq& q, int n) {
                     std::lock_guard<std::mutex> l(it->disk->mu);
                     it->disk->ok = false;
                 }
-                unlink(it->path.c_str());
+                if (qe_archive_store::may_unlink_unreadable(it->disk_readonly)) unlink(it->path.c_str());  // [al0-0038]
             }
             if (!ok) {
                 fprintf(stderr, "disk cache: state unreadable or checksum mismatch: %s\n", it->path.c_str());
