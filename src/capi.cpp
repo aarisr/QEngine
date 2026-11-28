@@ -280,6 +280,7 @@ int qe_class_admission_allowed(void* e, int cls, int reserved) {
 void qe_background_pause_stats(void* e, long long* count, double* seconds) {
     ((Engine*)e)->background_pause_stats(count, seconds);
 }
+void qe_restore_stats(void* e, long long* hits, long long* tokens) { ((Engine*)e)->restore_stats(hits, tokens); }
 // [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
 int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
 int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }
