@@ -3436,6 +3436,13 @@ bool Engine::archive_load(KvArchive& a) {
     archive_used_ += a.total;
     const size_t hits = disk_restore_hits_.fetch_add(1, std::memory_order_relaxed) + 1;
     disk_restore_tokens_.fetch_add((size_t)a.n, std::memory_order_relaxed);
+    if (a.disk_readonly) {
+        disk_restore_sibling_hits_.fetch_add(1, std::memory_order_relaxed);
+        disk_restore_sibling_tokens_.fetch_add((size_t)a.n, std::memory_order_relaxed);
+    } else {
+        disk_restore_own_hits_.fetch_add(1, std::memory_order_relaxed);
+        disk_restore_own_tokens_.fetch_add((size_t)a.n, std::memory_order_relaxed);
+    }
     if (pool_log_ || hits <= 3) printf("disk cache restore hit %zu: %d tokens\n", hits, a.n), fflush(stdout);
     return true;
 }

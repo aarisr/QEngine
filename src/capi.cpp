@@ -281,6 +281,10 @@ void qe_background_pause_stats(void* e, long long* count, double* seconds) {
     ((Engine*)e)->background_pause_stats(count, seconds);
 }
 void qe_restore_stats(void* e, long long* hits, long long* tokens) { ((Engine*)e)->restore_stats(hits, tokens); }
+void qe_restore_stats_by_source(void* e, long long* own_hits, long long* own_tokens, long long* sib_hits,
+                                long long* sib_tokens) {
+    ((Engine*)e)->restore_stats_by_source(own_hits, own_tokens, sib_hits, sib_tokens);
+}
 // [q27-park-c] park / unpark a decoding sequence beyond the seats (engine.h)
 int qe_park(void* e, int slot) { QE_STEP_CALL; return ((Engine*)e)->park(slot); }
 int qe_unpark(void* e, int h, int k, int* extra) { QE_STEP_CALL; return ((Engine*)e)->unpark(h, k, extra); }

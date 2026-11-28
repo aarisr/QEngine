@@ -226,10 +226,17 @@ public:
     bool pause_for(int n, int cls);
     bool class_admission_allowed(int cls, int reserved) const;
     void background_pause_stats(long long* count, double* seconds) const;
-    // [al0-restore-stats] disk/tier archives restored into RAM and the tokens they carried (engine lifetime)
+    // [al0-restore-stats] disk/tier archives restored into RAM and their tokens (engine lifetime).
     void restore_stats(long long* hits, long long* tokens) const {
         *hits = (long long)disk_restore_hits_.load(std::memory_order_relaxed);
         *tokens = (long long)disk_restore_tokens_.load(std::memory_order_relaxed);
+    }
+    void restore_stats_by_source(long long* own_hits, long long* own_tokens, long long* sib_hits,
+                                 long long* sib_tokens) const {
+        *own_hits = (long long)disk_restore_own_hits_.load(std::memory_order_relaxed);
+        *own_tokens = (long long)disk_restore_own_tokens_.load(std::memory_order_relaxed);
+        *sib_hits = (long long)disk_restore_sibling_hits_.load(std::memory_order_relaxed);
+        *sib_tokens = (long long)disk_restore_sibling_tokens_.load(std::memory_order_relaxed);
     }
     // Scheduling value of a slot's conversation (0 = finished subagent, 1 = normal, 2 = the main
     // thread): logs and slot_info only; no eviction, archive, pin, snapshot or pause order reads it
@@ -777,6 +784,10 @@ private:
     size_t disk_budget_ = 0;  // the largest tier cap: a file bigger than it is never planned
     std::atomic<size_t> disk_restore_hits_{0};
     std::atomic<size_t> disk_restore_tokens_{0};
+    std::atomic<size_t> disk_restore_own_hits_{0};
+    std::atomic<size_t> disk_restore_own_tokens_{0};
+    std::atomic<size_t> disk_restore_sibling_hits_{0};
+    std::atomic<size_t> disk_restore_sibling_tokens_{0};
     struct DiskJob {
         std::shared_ptr<Bufs> ram;
         std::vector<size_t> sizes;

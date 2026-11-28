@@ -424,11 +424,16 @@ class Metrics:
             m("parked_seconds_total", en.get("parked_seconds_total", 0),
               "interactive sequence seconds parked for background admissions", "counter")
         arch = en.get("archives") or {}
-        if "restore_hits" in arch:
-            m("archive_restore_hits_total", arch["restore_hits"],
-              "archives restored from the RAM/NVMe store into memory (engine lifetime)", "counter")
-            m("archive_restore_tokens_total", arch["restore_tokens"],
-              "tokens carried by archives restored from the RAM/NVMe store (engine lifetime)", "counter")
+        if all(key in arch for key in ("restore_hits_own", "restore_hits_sibling",
+                                       "restore_tokens_own", "restore_tokens_sibling")):
+            out.append("# HELP qengine_archive_restore_hits_total archives restored from writable or sibling read-only stores\n"
+                       "# TYPE qengine_archive_restore_hits_total counter")
+            out.append(f'qengine_archive_restore_hits_total{{source="own"}} {arch["restore_hits_own"]}')
+            out.append(f'qengine_archive_restore_hits_total{{source="sibling"}} {arch["restore_hits_sibling"]}')
+            out.append("# HELP qengine_archive_restore_tokens_total tokens carried by restored archives from each source\n"
+                       "# TYPE qengine_archive_restore_tokens_total counter")
+            out.append(f'qengine_archive_restore_tokens_total{{source="own"}} {arch["restore_tokens_own"]}')
+            out.append(f'qengine_archive_restore_tokens_total{{source="sibling"}} {arch["restore_tokens_sibling"]}')
         tiers = arch.get("tiers") or []
         for name, key, help_, typ in (
                 ("archive_tier_bytes", "bytes", "bytes held by the persistent archive tier", "gauge"),
