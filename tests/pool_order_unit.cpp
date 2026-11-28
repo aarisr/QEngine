@@ -105,5 +105,20 @@ int main() {
                               qe_pool::kClassBackground, 3, 2, false));
   printf(fails ? "pool_order_unit: %d FAILED\n" : "pool_order_unit: ok\n",
          fails);
+  // [al0-0041] class-aware: background pauses first whatever its age, then recency
+  {
+    using namespace qe_pool;
+    EXPECT(pauses_first_cls(kClassBackground, 1, kClassInteractive, 99));
+    EXPECT(!pauses_first_cls(kClassInteractive, 99, kClassBackground, 1));
+    EXPECT(pauses_first_cls(kClassInteractive, 30, kClassInteractive, 20));
+    EXPECT(pauses_first_cls(kClassBackground, 30, kClassBackground, 20));
+    // resume: a paused lane before paused bulk, whoever paused first
+    EXPECT(resumes_first_cls(kClassInteractive, 99, kClassBackground, 1));
+    EXPECT(!resumes_first_cls(kClassBackground, 1, kClassInteractive, 99));
+    EXPECT(resumes_first_cls(kClassBackground, 1, kClassBackground, 2));
+    // room: only a paused interactive sequence keeps its room
+    EXPECT(paused_room_reserved(kClassInteractive));
+    EXPECT(!paused_room_reserved(kClassBackground));
+  }
   return fails ? 1 : 0;
 }

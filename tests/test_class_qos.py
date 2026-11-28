@@ -116,6 +116,17 @@ assert app.PRIO_PAUSE_WAIT == 0.5
 assert g.pause_wait_of(pjob(0, 10, 1)) == min(app.PAUSE_WAIT, app.PRIO_PAUSE_WAIT)
 assert g.pause_wait_of(pjob(0, 10, 0)) == app.PAUSE_WAIT
 assert g.pause_wait_of(job(0, 10)) == app.PAUSE_WAIT
+# [al0-0041] an interactive request pauses at once while background decodes; background callers keep their wait
+assert g.pause_wait_of(job(0, 10), True) == 0.0
+assert g.pause_wait_of(pjob(0, 10, 1), True) == 0.0
+assert g.pause_wait_of(job(1, 10), True) == app.PAUSE_WAIT
+assert g.pause_wait_of(job(0, 10), False) == app.PAUSE_WAIT
+g.g.metrics = types.SimpleNamespace(active_by_class=lambda: {"interactive": 2, "background": 1})
+assert g.background_active() is True
+g.g.metrics = types.SimpleNamespace(active_by_class=lambda: {"interactive": 2, "background": 0})
+assert g.background_active() is False
+g.g.metrics = None
+assert g.background_active() is False
 
 # ---------------------------------------------------------------- metrics: class on jobs, queued_by_class, gauges
 tmp = tempfile.mkdtemp(prefix="qe_cls_")

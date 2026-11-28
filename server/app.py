@@ -1122,9 +1122,18 @@ class Admission:
                 j.est = len(j.ids) - e.probe_cached(j.ids)
                 j.t_est = now
 
-    def pause_wait_of(self, j):
-        """[al0-0040] How long a request that does not fit waits before it pauses decoders."""
+    def pause_wait_of(self, j, background_active=False):
+        """[al0-0040] How long a request that does not fit waits before it pauses decoders.
+        [al0-0041] An interactive request pauses at once while background sequences decode: bulk work
+        never holds a lane back (the engine pauses background first)."""
+        if j.cls != 1 and background_active:
+            return 0.0
         return self.prio_pause_wait if getattr(j, "prio", 0) else self.pause_wait
+
+    def background_active(self):
+        """[al0-0041] True while a background sequence is admitted (the metrics' class counts)."""
+        metrics = getattr(self.g, "metrics", None)
+        return bool(metrics and metrics.active_by_class().get("background", 0))
 
     def pick_next(self, now, prefills):
         """The queued requests that may be prefilled next, best first (empty: keep waiting): the
@@ -1310,7 +1319,7 @@ class Admission:
                               f"(waiting {now - blocked.t_enq:.1f} s) do not fit")
                 return i
             ps = e.pause_state() if hasattr(e, "pause_state") else None
-            if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait_of(j):
+            if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait_of(j, self.background_active()):
                 if hasattr(e, "protect_ids"):  # [ink-archprot] its archived conversation stays while the copies make room
                     e.protect_ids(j.ids, j)
                 ok = e.pause_for(need, j.cls)  # (background callers do not pause interactive decoders)

@@ -52,6 +52,23 @@ inline bool resumes_first(unsigned long long paused_a,
                           unsigned long long paused_b) {
   return paused_a < paused_b;
 }
+// [al0-0041] class-aware orders (owner 2026-11-28: paused and bulk requests
+// never block lanes). Pause: background sequences first, then the most recently
+// admitted. Resume: interactive sequences first, then first paused first. A
+// paused background sequence reserves no room at admission.
+inline bool pauses_first_cls(int cls_a, unsigned long long admit_a, int cls_b,
+                         unsigned long long admit_b) {
+  if (cls_a != cls_b)
+    return cls_a == kClassBackground;
+  return pauses_first(admit_a, admit_b);
+}
+inline bool resumes_first_cls(int cls_a, unsigned long long paused_a, int cls_b,
+                          unsigned long long paused_b) {
+  if (cls_a != cls_b)
+    return cls_a == kClassInteractive;
+  return resumes_first(paused_a, paused_b);
+}
+inline bool paused_room_reserved(int cls) { return cls != kClassBackground; }
 inline bool overwrite_first(int pos_a, unsigned long long used_a, int pos_b,
                             unsigned long long used_b) {
   return pos_a != pos_b ? pos_a < pos_b : used_a < used_b;

@@ -1269,7 +1269,7 @@ bool Engine::room_or_pause(int s, int need) {
             const Seq& x = seqs_[j];
             if (!x.active || x.paused || x.max_t <= 0 || pf_of(j)) continue;
             if ((int)j != s) others++;
-            if (v < 0 || qe_pool::pauses_first(x.admit, seqs_[v].admit)) v = j;  // the most recently admitted, no prio order
+            if (v < 0 || qe_pool::pauses_first_cls(x.cls, x.admit, seqs_[v].cls, seqs_[v].admit)) v = j;  // background first, then the most recently admitted [al0-0041]
         }
         if (others == 0 || v < 0 || !pause_slot(v)) break;  // alone (or not archivable): squeeze
         if (v == s) return false;
@@ -1734,7 +1734,9 @@ bool Engine::pause_for(int n, int cls) {
     const size_t need = units(std::min<size_t>((size_t)n + ah, max_ctx_));
     if (!slot) return false;
     if (used + need <= pool_tokens_) return true;
-    std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) { return qe_pool::pauses_first(seqs_[a.j].admit, seqs_[b.j].admit); });
+    std::stable_sort(vs.begin(), vs.end(), [&](const V& a, const V& b) {
+        return qe_pool::pauses_first_cls(seqs_[a.j].cls, seqs_[a.j].admit, seqs_[b.j].cls, seqs_[b.j].admit);  // [al0-0041]
+    });
     size_t k = 0, left = used;
     while (k < vs.size() && left + need > pool_tokens_) left -= vs[k++].u;
     if (left + need > pool_tokens_) return false;
@@ -1776,8 +1778,11 @@ bool Engine::can_admit(int n) {
         const Seq& q = seqs_[i];
         if (!q.active) slot = true;
         else if (pf_of(i)) used += units_of(q);  // its region already holds the whole prompt
-        else if (q.paused) used += units(std::min<size_t>((size_t)paused_.at(i).pos - q.split +
-                                                          seq_headroom(ah, paused_.at(i).pos, q.rlim), max_ctx_));  // resumes first
+        else if (q.paused) {
+            if (qe_pool::paused_room_reserved(q.cls))  // [al0-0041] a paused background sequence holds no room
+                used += units(std::min<size_t>((size_t)paused_.at(i).pos - q.split +
+                                               seq_headroom(ah, paused_.at(i).pos, q.rlim), max_ctx_));  // resumes first
+        }
         else used += units(std::min<size_t>((size_t)q.pos - q.split + seq_headroom(ah, q.pos, q.rlim), max_ctx_));
     }
     for (auto& p : pres_) used += units(p.n);
@@ -5561,7 +5566,7 @@ void Engine::step_batch(const int* slots, int n, int* out, int* cnt) {
             const Seq &x = seqs_[sl[a]], &y = seqs_[sl[b]];
             if (x.paused != y.paused) return x.paused;
             if (!x.paused) return false;
-            return qe_pool::resumes_first(paused_.at(sl[a]).at, paused_.at(sl[b]).at);
+            return qe_pool::resumes_first_cls(x.cls, paused_.at(sl[a]).at, y.cls, paused_.at(sl[b]).at);  // [al0-0041] lanes first
         });
         bool blocked = false;  // (while the pool is shrunk a head that did not fit blocks nothing behind it, R4-L4)
         for (int i : order) {
