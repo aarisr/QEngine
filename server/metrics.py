@@ -423,7 +423,13 @@ class Metrics:
               "interactive sequences parked for background admissions", "counter")
             m("parked_seconds_total", en.get("parked_seconds_total", 0),
               "interactive sequence seconds parked for background admissions", "counter")
-        tiers = (en.get("archives") or {}).get("tiers") or []
+        arch = en.get("archives") or {}
+        if "restore_hits" in arch:
+            m("archive_restore_hits_total", arch["restore_hits"],
+              "archives restored from the RAM/NVMe store into memory (engine lifetime)", "counter")
+            m("archive_restore_tokens_total", arch["restore_tokens"],
+              "tokens carried by archives restored from the RAM/NVMe store (engine lifetime)", "counter")
+        tiers = arch.get("tiers") or []
         for name, key, help_, typ in (
                 ("archive_tier_bytes", "bytes", "bytes held by the persistent archive tier", "gauge"),
                 ("archive_tier_objects", "objects", "archive files held by the persistent tier", "gauge"),

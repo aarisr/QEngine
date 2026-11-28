@@ -91,6 +91,7 @@ SIGS = {
     "qe_conv_list": (c_int, [c_void_p, P_i64, c_int]),
     "qe_pool_counters": (None, [c_void_p, P_i64]),
     "qe_background_pause_stats": (None, [c_void_p, P_i64, P_double]),
+    "qe_restore_stats": (None, [c_void_p, P_i64, P_i64]),
     "qe_class_admission_allowed": (c_int, [c_void_p, c_int, c_int]),
     "qe_watch_stops": (None, [c_void_p, c_int, c_int]),
     "qe_set_no_ahead": (None, [c_void_p, c_int, c_int]),
@@ -759,6 +760,10 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         bg_pause_seconds = (ctypes.c_double * 1)()
         if "qe_background_pause_stats" in self.fns:
             L.qe_background_pause_stats(h, bg_pause_count, bg_pause_seconds)
+        restore_hits = (ctypes.c_longlong * 1)()
+        restore_tokens = (ctypes.c_longlong * 1)()
+        if "qe_restore_stats" in self.fns:
+            L.qe_restore_stats(h, restore_hits, restore_tokens)
         cl = []
         if convs and "qe_conv_list" in self.fns:  # least recently used first: the next to leave VRAM / the archive
             m = 256
@@ -770,7 +775,8 @@ class Engine(SteeringMixin):  # + steer_info / set_steering / capture (server/st
         return {"pool_tokens": self.pool_tokens, "max_context": self.max_t, "slots": slots, "conversations": cl,
                 "archives": {"ram": int(a[0]), "ram_bytes": a[1], "disk": int(a[2]), "disk_bytes": a[3],
                              "pinned_bytes": a[4], "pinned_used": a[5], "disk_evictions": int(a[6]),
-                             "tiers": self.tier_stats()},
+                             "tiers": self.tier_stats(),
+                             "restore_hits": int(restore_hits[0]), "restore_tokens": int(restore_tokens[0])},
                 "events": {"grow": c[0], "move": c[1], "evict": c[2], "pause": c[3], "resume": c[4]},
                 "paused": c[5], "parked_interactive_total": bg_pause_count[0],
                 "parked_seconds_total": bg_pause_seconds[0]}
