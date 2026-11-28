@@ -966,6 +966,17 @@ class QaSplit:
 CLS_BG = {"background"}  # x-request-class header values that schedule as background (class 1)
 
 
+CLS_PRIO = {"priority"}  # x-request-class values that jump the interactive queue ([al0-0040], three classes, bead 01cf)
+
+
+def request_prio_of(headers_get):
+    """[al0-0040] 1 when x-request-class is 'priority' (case-insensitive, stripped), else 0. A priority
+    request stays class 0 for the engine (interactive pause/admission rules unchanged); the Python
+    scheduler orders it ahead of other interactive work and lets it pause sooner (prio_pause_wait)."""
+    v = headers_get("x-request-class")
+    return 1 if v and v.strip().lower() in CLS_PRIO else 0
+
+
 def request_class_of(headers_get):
     """The request's scheduling class from the x-request-class header: 1 (background) for 'background'
     (case-insensitive, stripped), 0 (interactive) for a missing or unknown value."""
@@ -1005,6 +1016,8 @@ class Admission:
         # a request pauses others only after waiting this long (a short turn does not pay two full KV transfers of a
         # sequence that would end in seconds; review M1)
         self.pause_wait = getattr(a, "pause_wait", PAUSE_WAIT)
+        # [al0-0040] a priority request that does not fit pauses sooner (short completion()/edit calls)
+        self.prio_pause_wait = min(self.pause_wait, getattr(a, "prio_pause_wait", PRIO_PAUSE_WAIT))
         self.k = a.mtp_k
         self.last_note = 0.0
         # several prompts in one prefill batch (Flash-Next): every admitted text prompt joins the next batches
@@ -1109,6 +1122,10 @@ class Admission:
                 j.est = len(j.ids) - e.probe_cached(j.ids)
                 j.t_est = now
 
+    def pause_wait_of(self, j):
+        """[al0-0040] How long a request that does not fit waits before it pauses decoders."""
+        return self.prio_pause_wait if getattr(j, "prio", 0) else self.pause_wait
+
     def pick_next(self, now, prefills):
         """The queued requests that may be prefilled next, best first (empty: keep waiting): the
         least left to compute, aged so that nothing starves (every second of waiting is worth
@@ -1121,7 +1138,8 @@ class Admission:
         if not q:
             return []
         self.estimate(now)
-        order = sorted(range(len(q)), key=lambda i: (q[i].cls, q[i].est - (now - q[i].t_enq) * self.aging))
+        order = sorted(range(len(q)), key=lambda i: (q[i].cls, -getattr(q[i], "prio", 0),
+                                                       q[i].est - (now - q[i].t_enq) * self.aging))
         if not prefills:
             return order
         join = []
@@ -1197,7 +1215,7 @@ class Admission:
         cap = self.join_cap()
         left = {id(j): len(j.ids) - max(0, self.e.prefill_pos(j.slot)) for j in prefills}
         def key(j):
-            return (left[id(j)] > cap, left[id(j)] - (now - j.t_enq) * self.aging)
+            return (left[id(j)] > cap, -getattr(j, "prio", 0), left[id(j)] - (now - j.t_enq) * self.aging)
         order = sorted(prefills, key=key)
         self.pos0 = None
         self.caps = {}
@@ -1292,7 +1310,7 @@ class Admission:
                               f"(waiting {now - blocked.t_enq:.1f} s) do not fit")
                 return i
             ps = e.pause_state() if hasattr(e, "pause_state") else None
-            if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait:
+            if ps is not None and ps[1] == 0 and now - j.t_enq >= self.pause_wait_of(j):
                 if hasattr(e, "protect_ids"):  # [ink-archprot] its archived conversation stays while the copies make room
                     e.protect_ids(j.ids, j)
                 ok = e.pause_for(need, j.cls)  # (background callers do not pause interactive decoders)
@@ -2142,6 +2160,7 @@ class Generator:
                              f"{max(self.engine.slots)}")
         job = Job(self, ids, p, on_text, cancelled, affinity, cls)
         job.session = session_hash_of(req.headers.get) if req is not None else None
+        job.prio = request_prio_of(req.headers.get) if req is not None else 0
         job.cache_ttl_s = cache_ttl_of(req.headers.get) if req is not None else cache_ttl_of(lambda _: None)
         img = getattr(ids, "img", (0, 0))
         self.metrics.queued(job, getattr(ids, "label", "") or "chat", img[0], img[1])
@@ -2828,6 +2847,7 @@ PARK_RESERVE = 2  # --park-reserve default: seats kept for prompts while replies
 PARK_RESERVE_MULTI = 4  # the same with shared prefill batches (Flash-Next, [qfn-ttft-park]: c32 / c64 p95 0.87 / 0.80 -> 0.64 / 0.65 s)
 QA_TAU = 2.0  # s: the window of the decoders' floor share (queue-aware split, --prefill-share-min)
 MULTI_MAX = 8  # prompts in flight that share prefill batches (the engine's FLASH_MAX_PREFILLS default)
+PRIO_PAUSE_WAIT = 0.5  # [al0-0040] the pause wait of an x-request-class: priority request (s)
 PAUSE_WAIT = 3.0  # --pause-wait default (s): how long a request that does not fit waits before it pauses others
 LONG_SHARE = 0.5  # --long-share default where passes are copy-bound (the knee for short appends)
 PASS_BOUND_CHUNK = 4096  # the prefill chunk while others decode on pass-bound servers (measured)
@@ -2859,6 +2879,7 @@ class Job:
         self.gen, self.ids, self.p, self.on_text, self.cancelled = gen, ids, p, on_text, cancelled
         self.affinity = affinity
         self.cls = cls
+        self.prio = 0  # [al0-0040] 1: x-request-class priority (request_prio_of), queued ahead within its class
         self.cache_ttl_s = 0  # the request's x-cache-ttl class in seconds (cache_ttl_of)
         self.session = None  # the request's x-session-hash header (session_hash_of): the [chat] line and /api/stats recent[]
         self.lp = p.get("logprobs")

@@ -82,6 +82,41 @@ g = adm_with([job(1, 50000), job(1, 1000)], aging=0)
 assert g.pick_next(NOW, []) == [1, 0], "background order by size alone without aging"
 assert adm_with([]).pick_next(NOW, []) == [], "empty queue"
 
+# ---------------------------------------------------------------- [al0-0040] priority within interactive
+assert app.CLS_PRIO == {"priority"}
+assert app.request_prio_of(hdr("priority")) == 1
+assert app.request_prio_of(hdr("  Priority ")) == 1, "case-insensitive, stripped"
+assert app.request_prio_of(hdr("background")) == 0
+assert app.request_prio_of(hdr(None)) == 0 and app.request_prio_of(hdr("prio")) == 0
+assert app.request_class_of(hdr("priority")) == 0, "priority stays engine class 0 (interactive rules)"
+
+
+def pjob(cls, est, prio, waited=0.0):
+    j = job(cls, est, waited)
+    j.prio = prio
+    return j
+
+
+# a fresh, LARGER priority request goes before a smaller interactive one that has waited
+g = adm_with([pjob(0, 1000, 0, waited=2), pjob(0, 5000, 1)])
+assert g.pick_next(NOW, []) == [1, 0], "priority first within interactive"
+# background stays last even behind... nothing: a priority request never jumps the class order upward wrongly
+g = adm_with([pjob(1, 10, 0), pjob(0, 50000, 0), pjob(0, 50000, 1)])
+assert g.pick_next(NOW, []) == [2, 1, 0], "priority, then interactive, then background"
+# aging still orders inside the priority group
+g = adm_with([pjob(0, 5000, 1, waited=2), pjob(0, 1000, 1)])
+assert g.pick_next(NOW, []) == [0, 1], "aging within priority"
+# a job without the attribute (older callers) counts as not priority
+legacy = job(0, 10)
+g = adm_with([legacy, pjob(0, 10000, 1)])
+assert g.pick_next(NOW, []) == [1, 0], "missing prio = 0"
+# pause wait: a priority request pauses after PRIO_PAUSE_WAIT, others after pause_wait
+g = adm_with([])
+assert app.PRIO_PAUSE_WAIT == 0.5
+assert g.pause_wait_of(pjob(0, 10, 1)) == min(app.PAUSE_WAIT, app.PRIO_PAUSE_WAIT)
+assert g.pause_wait_of(pjob(0, 10, 0)) == app.PAUSE_WAIT
+assert g.pause_wait_of(job(0, 10)) == app.PAUSE_WAIT
+
 # ---------------------------------------------------------------- metrics: class on jobs, queued_by_class, gauges
 tmp = tempfile.mkdtemp(prefix="qe_cls_")
 m = metrics.Metrics(os.path.join(tmp, "stats.json"))
